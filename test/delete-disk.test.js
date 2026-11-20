@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
-import { withDeleteLocks } from './delete-disk.js';
-import { captureSessionMember } from './disk-trash.js';
-import { withFileLock } from './online-disk.js';
+import { withDeleteLocks } from '../src/delete-disk.js';
+import { captureSessionMember } from '../src/disk-trash.js';
+import { withFileLock } from '../src/online-disk.js';
 
 const lockName = 'session.lock';
 const current = 'session.v4.jsonl.zstd';

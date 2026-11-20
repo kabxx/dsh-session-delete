@@ -7,8 +7,8 @@ import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { captureSessionMember, runDiskOperation } from './disk-trash.js';
-import { runOnlineDiskOperation, withFileLock } from './online-disk.js';
+import { captureSessionMember, runDiskOperation } from '../src/disk-trash.js';
+import { runOnlineDiskOperation, withFileLock } from '../src/online-disk.js';
 
 const run = promisify(execFile);
 const testLinux = (name, fn) => test(name, { skip: process.platform !== 'linux' }, fn);

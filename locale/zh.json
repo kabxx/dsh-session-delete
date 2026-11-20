@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-session-delete",
+    "description": "通过会话右键菜单永久删除会话及其关联记录。"
+  }
+}

@@ -3,8 +3,8 @@ import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { createSessionDelete } from './delete.js';
-import { captureDirectory, withDirectoryLocks } from './delete-tree.js';
+import { createSessionDelete } from '../src/delete.js';
+import { captureDirectory, withDirectoryLocks } from '../src/delete-tree.js';
 
 const linuxTest = (name, body) => test(name, { skip: process.platform !== 'linux' }, body);
 

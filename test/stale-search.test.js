@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { cleanStaleSearch, configuredDisabledSearchPath } from './stale-search.js';
+import { cleanStaleSearch, configuredDisabledSearchPath } from '../src/stale-search.js';
 
 const ids = ['main', "child' OR 1=1 --", 'MAIN', 'main-other'];
 

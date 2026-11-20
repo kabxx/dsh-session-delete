@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-session-delete",
+    "description": "Permanently delete sessions and their associated records from the session context menu."
+  }
+}

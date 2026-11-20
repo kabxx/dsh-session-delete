@@ -4,7 +4,7 @@ import { access, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeF
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { captureSessionMember, runDiskOperation, validateSessionLocation } from './disk-trash.js';
+import { captureSessionMember, runDiskOperation, validateSessionLocation } from '../src/disk-trash.js';
 
 async function fixture(t) {
   const home = await mkdtemp(join(await realpath(tmpdir()), 'dsh-disk-trash-'));

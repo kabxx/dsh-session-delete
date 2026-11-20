@@ -3,7 +3,7 @@ import { access, link, mkdir, mkdtemp, readFile, rm, rmdir, symlink, writeFile }
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
-import { removeStaleProjection } from './stale-projection.js';
+import { removeStaleProjection } from '../src/stale-projection.js';
 
 class JsonStorageBackend {
   constructor(root) { this.root = root; }

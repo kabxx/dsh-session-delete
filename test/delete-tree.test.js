@@ -4,8 +4,8 @@ import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { captureDirectory, withDirectoryLocks } from './delete-tree.js';
-import { withFileLock } from './online-disk.js';
+import { captureDirectory, withDirectoryLocks } from '../src/delete-tree.js';
+import { withFileLock } from '../src/online-disk.js';
 
 const linuxTest = (name, body) => test(name, { skip: process.platform !== 'linux' }, body);
 const log = 'session.v4.jsonl.zstd';

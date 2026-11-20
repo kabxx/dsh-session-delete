@@ -1,11 +1,44 @@
-# dsh-session-delete
+# @kabxx/dsh-session-delete
 
-在 DSH `0.2.2-rc.5` 的工作区里右键会话，选择归档下方红色的「删除会话」。确认框会显示会话名称以及将一起删除的专属子代理会话数量。点「永久删除」后无法恢复。
+面向 DeepSeek Harness Web（`0.2.2-rc.5`）的会话永久删除插件（支持 Linux 与 WSL 默认 JSONL 存储）。
 
-插件会递归删除这些会话的完整目录，并按会话 ID 清理工作区、置顶、归档、缓存和搜索索引记录。缓存服务停用时，清理默认 JSON 存储里的已知格式快照。全文搜索停用时，清理能从配置定位的原生 SQLite 索引条目。不存在或无法核实的缓存和索引会直接略过，清理实际失败时才额外提示。目录外的第三方插件数据和共享附件保留。
+- 在会话右键菜单（`归档会话` 下方）增加红色的「删除会话」入口，确认框展示会话标题及将一并移除的子智能体会话数量。
+- 确认后递归删除对应 JSONL 会话目录，并同步清理工作区关联、置顶、归档、投影缓存与 SQLite 全文搜索索引记录。
+- 自动释放空闲的 Web 会话句柄并通过 `flock` 文件锁校验状态；运行中会话或仍有未迁移分叉依赖时拒绝删除。
 
-此版本支持 Linux 和 WSL 上的默认 JSONL 会话存储。会话正在运行或有排队消息时，DSH 原生 Toast 会提示先停止会话。确认删除后，插件会让 DSH 释放它能够识别的空闲 Web 写入者，再获取写锁。其他写入者仍占用文件时，插件会拒绝删除。独立分叉保留。旧版分叉仍依赖原日志时，须先完成格式迁移。
+## 安装
 
-发布后，可在 DSH 插件管理器安装 `@kabxx/dsh-session-delete@0.1.0`。本地测试可用 `npm pack ./bundle` 打包，再安装生成的 `kabxx-dsh-session-delete-0.1.0.tgz`。Web 请求沿用 DSH 的所有者访问规则。旧版垃圾桶中已有的数据仍保存在原来的插件存储中。
+需要运行在 Linux 或 WSL 环境（Node.js `>= 24.9.0`，系统包含 `/usr/bin/flock`）：
 
-首次正式发布前，开发和测试包统一使用 `0.1.0`。Git 只保留一个 Conventional Commit，后续修改用 `git commit --amend` 合并到这个提交中。
+```bash
+dsh plugin --profile web add @kabxx/dsh-session-delete
+```
+
+也可在 DSH 插件管理器中选择「添加插件」并输入 `@kabxx/dsh-session-delete`。本地调试源码时，直接填入克隆后的仓库目录绝对路径或执行 `dsh plugin --profile web add .` 即可。
+
+## 开发
+
+本包无外部依赖、无构建步骤，直接基于 Node.js 原生 ESM 运行：
+
+```bash
+npm run check
+npm test
+npm pack --dry-run
+```
+
+## 项目结构
+
+| 路径 | 内容 |
+| --- | --- |
+| [`src/index.js`](src/index.js) | Host 入口，注册 `/api/session-delete/session` 接口 |
+| [`src/delete.js`](src/delete.js) | 删除预览、确认票据、中断恢复与原生索引/工作区记录清理 |
+| [`src/delete-tree.js`](src/delete-tree.js) | 会话目录锁校验、暂存移出与递归删除 |
+| [`src/idle-web-writer.js`](src/idle-web-writer.js) | 识别并释放空闲的 Web 会话写入句柄 |
+| [`src/online-disk.js`](src/online-disk.js) | JSONL 路径安全校验与内核 `flock` 锁封装 |
+| [`src/stale-projection.js`](src/stale-projection.js) | 投影缓存未挂载时清理残留 JSON 快照 |
+| [`src/stale-search.js`](src/stale-search.js) | 搜索服务停用时清理原生 SQLite 全文索引条目 |
+| [`src/client.js`](src/client.js) | Web 客户端右键菜单项、确认弹窗与 Toast 提示 |
+| [`locale/`](locale/) | 插件管理页中英文标题与描述 |
+| [`test/`](test/) | 锁竞争、崩溃恢复、投影与全文索引清理集成测试 |
+
+插件入口与注入配置见 [package.json](package.json) 和 [cordis.patch.yml](cordis.patch.yml)。
