@@ -1,0 +1,7 @@
+node_modules/
+*.tgz
+
+# 本地保留的旧版实验
+/dsh-0.2.2-rc.5-session-delete.patch
+/bundle/maintenance.js
+/bundle/trash.js
