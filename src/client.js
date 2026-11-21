@@ -43,7 +43,6 @@ window.__ModuleLoader__.load({
       'restored', 'restore-pending', 'recovery-pending', 'cleanup-pending',
     ]);
     const dangerColor = 'var(--dsw-alias-state-error-primary)';
-    const danger = { color: dangerColor };
 
     return {
       inject: ['contextMenus', 'locale', 'slots', 'workspaces', 'remoteAccess'],
@@ -135,7 +134,18 @@ window.__ModuleLoader__.load({
           const description = t(message, { title: title || t('untitled'), count });
           return h(Fragment, null,
             // DSH Modal only exposes a warning tone. Recolor its native icon for this dialog.
-            h('style', null, `.dsh-session-delete-confirm h2 > svg[aria-hidden="true"] { color: ${dangerColor}; }`),
+            h('style', null, `
+              .dsh-session-delete-confirm h2 > svg[aria-hidden="true"] { color: ${dangerColor}; }
+              .dsh-session-delete-confirm .dsh-session-delete-confirm-action:not(:disabled) {
+                --dsh-button-outline-color: ${dangerColor};
+                color: ${dangerColor};
+              }
+              @media (hover: hover) {
+                .dsh-session-delete-confirm .dsh-session-delete-confirm-action:hover:not(:disabled) {
+                  background: var(--dsw-alias-interactive-bg-hover-danger);
+                }
+              }
+            `),
             h(Modal, {
               open: true, className: 'dsh-session-delete-confirm', tone: 'warning',
               title: t('title'), description, closeLabel: t('close'), onClose: dismiss,
@@ -143,7 +153,7 @@ window.__ModuleLoader__.load({
                 h('span', { id: descriptionId, hidden: true }, description),
                 h(Button, { variant: 'outline', 'data-modal-autofocus': true, 'aria-describedby': descriptionId,
                   disabled: pending, onClick: dismiss }, t('cancel')),
-                h(Button, { variant: 'outline', style: pending ? undefined : danger, disabled: pending,
+                h(Button, { variant: 'outline', className: 'dsh-session-delete-confirm-action', disabled: pending,
                   'aria-describedby': descriptionId, onClick: confirm }, t('confirm'))),
             }, pending ? h('span', { role: 'status' }, t('pending')) : undefined));
         }
