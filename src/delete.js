@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { open, readFile, stat, unlink } from 'node:fs/promises';
+import { lstat, open, readFile, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { withDeleteLocks } from './delete-disk.js';
@@ -9,7 +9,9 @@ import { publishPath, syncDirectory } from './platform-fs.js';
 import { idleWebWriter, releaseIdleWebWriters } from './idle-web-writer.js';
 import { removeStaleProjection } from './stale-projection.js';
 import { cleanStaleSearch, configuredDisabledSearchPath } from './stale-search.js';
+import manifest from '../package.json' with { type: 'json' };
 
+const recordJournal = Symbol('record journal');
 const ticketLifetime = 5 * 60_000;
 const maxTickets = 64;
 const settlementBudget = 1200;
@@ -56,11 +58,23 @@ function validateEntry(entry) {
   return entry;
 }
 
+async function journalExists(path) {
+  try {
+    const info = await lstat(path);
+    if (!info.isFile() || info.nlink !== 1) fail('unsafe-path');
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 async function readEntries(journal) {
+  if (!await journalExists(journal)) return [];
   const state = await readJson(journal);
   if (state === undefined || ([1, 2].includes(state?.version) && state.members === null)) return [];
-  if ([3, 4].includes(state?.version) && Array.isArray(state.entries)) return state.entries.map(validateEntry);
-  return [validateEntry(state)];
+  const entries = [3, 4].includes(state?.version) && Array.isArray(state.entries) ? state.entries : [state];
+  return entries.map((entry) => ({ ...validateEntry(entry), [recordJournal]: journal }));
 }
 
 function writeEntries(journal, entries) {
@@ -97,8 +111,9 @@ function samePlan(a, b) {
   });
 }
 
-export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
+export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyTrash }) {
   const staging = join(dirname(journal), 'directory-deletion');
+  const previousJournal = legacyJournal && legacyJournal !== journal ? legacyJournal : undefined;
   const registry = ctx.workspaceRegistry;
   const tickets = new Map();
   let chain = Promise.resolve();
@@ -191,13 +206,19 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
   }
 
   async function recoverEntry(entry, entries) {
+    const sourceJournal = entry[recordJournal];
+    const sourceStaging = join(dirname(sourceJournal), 'directory-deletion');
     const remaining = entries.filter((pending) => pending !== entry);
     try {
+      const ids = new Set(entry.members.map(({ id }) => id));
+      if (remaining.some(({ members }) => members.some(({ id }) => ids.has(id)))) fail('collision');
       // A prior rename of the journal may have succeeded before directory fsync failed.
       // Make the visible decision durable before acting on it.
-      await syncDirectory(dirname(journal));
-      if (entry.phase === 'prepared') {
-        await withDirectoryLocks({ root, staging, ...entry }, (lease) => lease.rollback());
+      await syncDirectory(dirname(sourceJournal));
+      const { members, transaction, phase } = entry;
+      const directoryPlan = { root, staging: sourceStaging, members, transaction, phase };
+      if (phase === 'prepared') {
+        await withDirectoryLocks(directoryPlan, (lease) => lease.rollback());
       } else {
         const complete = async (lease) => {
           await assertInactive(entry.members.map(({ id }) => id));
@@ -207,10 +228,10 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
         if (entry.version === 1) {
           await withDeleteLocks({ root, members: entry.members, committed: true }, complete);
         } else {
-          await withDirectoryLocks({ root, staging, ...entry }, complete);
+          await withDirectoryLocks(directoryPlan, complete);
         }
       }
-      await writeEntries(journal, remaining);
+      await writeEntries(sourceJournal, remaining.filter((pending) => pending[recordJournal] === sourceJournal));
     } catch (error) {
       ctx.logger.warn('Session delete recovery: %s', error);
       fail(entry.phase === 'prepared' ? 'restore-pending' : 'cleanup-pending');
@@ -256,6 +277,7 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
         return releaseIdleWebWriters(ctx, writers);
       });
     }
+    const localEntries = entries.filter((entry) => entry[recordJournal] === journal);
     let prepared;
     let committing = false;
     let committed = false;
@@ -266,19 +288,19 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
           async prepare(plan) {
             if (!samePlan(members, (await describe(id, entries)).members)) fail('changed');
             request.signal.throwIfAborted();
-            const entry = { version: 3, phase: 'prepared', ...plan };
-            await writeEntries(journal, [...entries, entry]);
+            const entry = { version: 3, phase: 'prepared', pluginVersion: manifest.version, ...plan, [recordJournal]: journal };
+            await writeEntries(journal, [...localEntries, entry]);
             prepared = entry;
           },
           async commit() {
             request.signal.throwIfAborted();
             committing = true;
-            await writeEntries(journal, [...entries, { ...prepared, phase: 'committed' }]);
+            await writeEntries(journal, [...localEntries, { ...prepared, phase: 'committed' }]);
             committed = true;
           },
         });
         await finish(members);
-        await writeEntries(journal, entries);
+        await writeEntries(journal, localEntries);
       });
     } catch (error) {
       if (!prepared) throw error;
@@ -298,8 +320,22 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
   }
 
   async function withJournal(run) {
-    await directoryTree(dirname(journal), true);
-    return withFileLock(`${journal}.lock`, async () => run(await readEntries(journal)));
+    const current = async () => {
+      await directoryTree(dirname(journal), true);
+      return withFileLock(`${journal}.lock`, async () => run([
+        ...(previousJournal ? await readEntries(previousJournal) : []),
+        ...await readEntries(journal),
+      ]));
+    };
+    if (previousJournal) {
+      // Preserve the old lock and staging layout while completing old intents in place.
+      const previousDirectory = await lstat(dirname(previousJournal)).catch((error) => {
+        if (error.code === 'ENOENT') return;
+        throw error;
+      });
+      if (previousDirectory) return withFileLock(`${previousJournal}.lock`, current);
+    }
+    return current();
   }
 
   const handle = (request) => {
@@ -332,10 +368,9 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
   };
   handle.recoverPending = (signal) => {
     const result = chain.then(async () => {
-      // Only the new, explicit phase records get unattended recovery.
-      if (!await stat(journal).catch((error) => { if (error.code === 'ENOENT') return; throw error; })) return;
+      if (signal?.aborted || (!await journalExists(journal) && (!previousJournal || !await journalExists(previousJournal)))) return;
       await withJournal(async (entries) => {
-        for (const entry of entries.filter(({ version }) => version === 3)) {
+        for (const entry of entries.filter((entry) => entry.version === 3 || entry[recordJournal] === previousJournal)) {
           if (signal?.aborted) break;
           try { entries = await recoverEntry(entry, entries); }
           catch { /* The failure is recorded and isolated to this group. */ }

@@ -63,8 +63,8 @@ async function fixture(t) {
       } }) }) };
     },
   };
-  const start = () => {
-    const handle = createSessionDelete(ctx, options);
+  const start = (overrides) => {
+    const handle = createSessionDelete(ctx, { ...options, ...overrides });
     return Object.assign(async (action, id, ticket) => {
       const response = await handle(new Request('http://localhost/api/session-delete/session', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, id, ticket }),
@@ -182,6 +182,38 @@ async function recordInterruptedGroup(f, phase) {
   })), /simulated interruption/u);
   return transaction;
 }
+
+platformTest('new deletes use the package journal while legacy staged data is recovered in place', async (t) => {
+  const f = await fixture(t);
+  const pending = await recordInterruptedGroup(f, 'committed');
+  const journal = join(f.base, 'plugins', '@kabxx', 'dsh-session-delete', 'delete-intent.json');
+  const newOptions = { journal, legacyJournal: f.journal };
+  const [status, value] = await confirm(f.start(newOptions), 'b');
+  assert.equal(status, 200);
+  assert.deepEqual(value, { deleted: true });
+  assert.deepEqual(f.attempts, ['b']);
+  assert.ok((await f.readJournal()).entries.length);
+  assert.deepEqual(JSON.parse(await readFile(journal, 'utf8')).entries, []);
+  assert.equal(await readFile(join(pending, '0', 'session.v4.jsonl'), 'utf8'), 'a');
+
+  await f.start(newOptions).recover();
+  assert.deepEqual(f.attempts, ['b', 'a', 'a-child']);
+  assert.deepEqual((await f.readJournal()).entries, []);
+  await assert.rejects(lstat(pending), { code: 'ENOENT' });
+});
+
+platformTest('a fresh install does not create the legacy directory', async (t) => {
+  const f = await fixture(t);
+  const journal = join(f.base, 'plugins', '@kabxx', 'dsh-session-delete', 'delete-intent.json');
+  const legacy = join(f.base, 'previous', 'delete-intent.json');
+  f.failing.add('b');
+  assert.deepEqual(await confirm(f.start({ journal, legacyJournal: legacy }), 'b'),
+    [200, { deleted: true, cleanupPending: true }]);
+  await assert.rejects(lstat(join(legacy, '..')), { code: 'ENOENT' });
+  const { entries: [entry] } = JSON.parse(await readFile(journal, 'utf8'));
+  assert.equal(entry.pluginVersion, '0.1.0');
+  assert.equal(entry.phase, 'committed');
+});
 
 platformTest('rollback defers recovery while an already detached replacement still has a writer', async (t) => {
   const f = await fixture(t);

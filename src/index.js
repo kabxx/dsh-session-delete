@@ -5,7 +5,8 @@ export const inject = ['connection', 'workspaceRegistry', 'sessions', 'agents', 
 export function apply(ctx) {
   const remove = createSessionDelete(ctx, {
     root: ctx.dshHomePath('sessions'),
-    journal: ctx.dshHomePath('session-delete', 'delete-intent.json'),
+    journal: ctx.dshHomePath('plugins', '@kabxx', 'dsh-session-delete', 'delete-intent.json'),
+    legacyJournal: ctx.dshHomePath('session-delete', 'delete-intent.json'),
     legacyTrash: ctx.dshHomePath('session-delete', 'trash.json'),
   });
   ctx.effect(() => {
