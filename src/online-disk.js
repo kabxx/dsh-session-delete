@@ -1,12 +1,9 @@
-import { spawn } from 'node:child_process';
-import { constants } from 'node:fs';
-import { lstat, mkdir, open, readdir, rename, rmdir, unlink } from 'node:fs/promises';
+import { lstat, mkdir, readdir, rename, rmdir, unlink } from 'node:fs/promises';
 import { dirname, isAbsolute, join, parse, relative, resolve, sep } from 'node:path';
 import { validateSessionLocation } from './disk-trash.js';
+import { acquirePathLock, assertPlainWindowsPath, syncDirectory, verifyPathLock } from './platform-fs.js';
 
 const lockName = 'session.lock';
-const flockPath = '/usr/bin/flock';
-const conflictExit = 73;
 const ticketName = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const logName = /^session(?:\.v([1-9][0-9]*))?\.jsonl(?:\.zstd)?$/u;
 const transitions = {
@@ -40,15 +37,12 @@ function sameIdentity(info, expected) {
 
 async function directory(path, device) {
   const info = await stat(path);
-  if (info && !info.isDirectory()) fail('unsafe-path');
+  if (info) {
+    if (!info.isDirectory()) fail('unsafe-path');
+    assertPlainWindowsPath(path);
+  }
   if (info && device !== undefined && info.dev !== device) fail('cross-device');
   return info;
-}
-
-async function syncDirectory(path) {
-  const handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  try { await handle.sync(); }
-  finally { await handle.close(); }
 }
 
 async function ensureDirectory(path, device, create) {
@@ -87,56 +81,17 @@ function sourcePath(root, member) {
   return source;
 }
 
-function kernelFlock(fd) {
-  return new Promise((resolveLock, rejectLock) => {
-    // File descriptor 3 is a duplicate of the parent's open file description.
-    // flock(2) keeps it locked after this child exits until the parent closes it.
-    const child = spawn(flockPath, ['-xn', '-E', String(conflictExit), '3'], {
-      stdio: ['ignore', 'ignore', 'ignore', fd],
-      timeout: 3000,
-    });
-    child.once('error', (error) => rejectLock(Object.assign(error, { code: 'unsupported' })));
-    child.once('close', (code) => {
-      if (code === 0) resolveLock();
-      else rejectLock(Object.assign(new Error('Unable to acquire the DSH session lease'), {
-        code: code === conflictExit ? 'locked' : 'unsupported',
-      }));
-    });
-  });
-}
-
 async function verifySource(item, device) {
   if (!await directory(dirname(item.source), device)) fail('missing');
   if (!sameIdentity(await directory(item.source, device), item.sourceIdentity ?? item.member.identity)) fail('collision');
-  const current = await stat(item.lockPath);
-  if (!current?.isFile() || current.nlink !== 1n || !sameIdentity(current, item.lockIdentity)) fail('collision');
-}
-
-async function openFileLock(path, device) {
-  if (process.platform !== 'linux') fail('unsupported');
-  const existing = await stat(path);
-  if (existing && (!existing.isFile() || existing.nlink !== 1n
-    || (device !== undefined && existing.dev !== device))) fail('unsafe-path');
-  const handle = await open(path, constants.O_CREAT | constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK, 0o600);
-  try {
-    const held = await handle.stat({ bigint: true });
-    if (!held.isFile() || held.nlink !== 1n || (device !== undefined && held.dev !== device)) fail('unsafe-path');
-    await kernelFlock(handle.fd);
-    const lockedIdentity = identity(held);
-    const current = await stat(path);
-    if (!current?.isFile() || current.nlink !== 1n || !sameIdentity(current, lockedIdentity)) fail('collision');
-    return { handle, lockedIdentity };
-  } catch (error) {
-    await handle.close();
-    throw error;
-  }
+  await verifyPathLock(item.lockPath, item.lockIdentity);
 }
 
 /** Serialize plugin journal access across processes using the stable lock inode. */
 export async function withFileLock(path, callback) {
   if (typeof callback !== 'function') fail('bad-state');
   const parent = await directoryTree(dirname(path), false);
-  const { handle } = await openFileLock(path, parent.dev);
+  const { handle } = await acquirePathLock(path, parent.dev);
   try { return await callback(); }
   finally { await handle.close(); }
 }
@@ -146,7 +101,7 @@ async function lockSource(item, device) {
   const source = await directory(item.source, device);
   if (!sameIdentity(source, item.sourceIdentity ?? item.member.identity)) fail('collision');
   item.lockPath = join(item.source, lockName);
-  const { handle, lockedIdentity } = await openFileLock(item.lockPath, device);
+  const { handle, lockedIdentity } = await acquirePathLock(item.lockPath, device);
   try {
     item.lockIdentity = lockedIdentity;
     await verifySource(item, device);

@@ -23,8 +23,8 @@
     "icon.svg"
   ],
   "scripts": {
-    "check": "for f in src/*.js; do node --check \"$f\"; done",
-    "test": "node --test test/*.test.js"
+    "check": "node -e \"for (const f of require('node:fs').readdirSync('src')) if (f.endsWith('.js')) require('node:child_process').execFileSync(process.execPath, ['--check', 'src/' + f], {stdio: 'inherit'})\"",
+    "test": "node --test \"test/*.test.js\""
   },
   "engines": {
     "node": ">=24.9.0",

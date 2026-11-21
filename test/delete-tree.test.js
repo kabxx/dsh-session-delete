@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { captureDirectory, withDirectoryLocks } from '../src/delete-tree.js';
 import { withFileLock } from '../src/online-disk.js';
 
-const linuxTest = (name, body) => test(name, { skip: process.platform !== 'linux' }, body);
+const platformTest = (name, body) => test(name, { skip: process.platform !== 'linux' && !process.env.DSH_INSTALL_DIR }, body);
 const log = 'session.v4.jsonl.zstd';
 const lock = 'session.lock';
 
@@ -26,12 +26,12 @@ async function fixture(t) {
   return { root, staging, members, dirs };
 }
 
-linuxTest('removes whole verified directories, including sidecars and links, without following links', async (t) => {
+platformTest('removes whole verified directories, including sidecars and links, without following links', async (t) => {
   const { dirs, ...input } = await fixture(t);
   await writeFile(join(dirs.parent, 'session.v2.jsonl'), 'old rollout');
   await mkdir(join(dirs.child, 'plugin'));
   await writeFile(join(dirs.child, 'plugin', 'note.txt'), 'sidecar');
-  await symlink(dirs.other, join(dirs.child, 'plugin', 'outside'));
+  await symlink(dirs.other, join(dirs.child, 'plugin', 'outside'), 'junction');
   await withDirectoryLocks(input, ({ remove }) => remove(async (plan) => {
     assert.ok(plan.transaction);
     assert.equal(await readFile(join(dirs.parent, log), 'utf8'), 'parent');
@@ -42,7 +42,7 @@ linuxTest('removes whole verified directories, including sidecars and links, wit
   assert.deepEqual(await readdir(input.staging), []);
 });
 
-linuxTest('a live writer or failed journal leaves both directories untouched', async (t) => {
+platformTest('a live writer or failed journal leaves both directories untouched', async (t) => {
   const { dirs, ...input } = await fixture(t);
   await withFileLock(join(dirs.child, lock), () => assert.rejects(withDirectoryLocks(input, () => assert.fail()), { code: 'locked' }));
   await assert.rejects(withDirectoryLocks(input, ({ remove }) => remove(() => { throw Error('durability'); })), /durability/u);
@@ -50,7 +50,7 @@ linuxTest('a live writer or failed journal leaves both directories untouched', a
   assert.equal(await readFile(join(dirs.child, log), 'utf8'), 'child');
 });
 
-linuxTest('recovery removes staged identities and never a replacement at the original path', async (t) => {
+platformTest('recovery removes staged identities and never a replacement at the original path', async (t) => {
   const { dirs, ...input } = await fixture(t);
   let committed;
   await assert.rejects(withDirectoryLocks(input, ({ remove }) => remove((plan) => {
@@ -71,7 +71,7 @@ linuxTest('recovery removes staged identities and never a replacement at the ori
   assert.equal(await readFile(join(dirs.parent, log), 'utf8'), 'replacement');
 });
 
-linuxTest('rejects a foreign directory using an existing staging transaction', async (t) => {
+platformTest('rejects a foreign directory using an existing staging transaction', async (t) => {
   const { dirs, ...input } = await fixture(t);
   const transaction = randomUUID();
   await mkdir(input.staging, { mode: 0o700 });

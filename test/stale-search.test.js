@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -9,7 +9,7 @@ import { cleanStaleSearch, configuredDisabledSearchPath } from '../src/stale-sea
 const ids = ['main', "child' OR 1=1 --", 'MAIN', 'main-other'];
 
 function testDirectory() {
-  return mkdtempSync(join(tmpdir(), 'dsh-delete-search-test-'));
+  return mkdtempSync(join(realpathSync(tmpdir()), 'dsh-delete-search-test-'));
 }
 
 function fixture(path, extras = '') {
@@ -62,7 +62,7 @@ function readSearch(path) {
 }
 
 test('removes exact native SQLite and FTS rows without touching similarly named sessions', async () => {
-  const path = join(testDirectory(), 'index ? # %.sqlite');
+  const path = join(testDirectory(), 'index # %.sqlite');
   fixture(path);
   const inode = statSync(path).ino;
   const expected = { sessions: ['MAIN', 'main-other'], docs: ['MAIN', 'MAIN', 'main-other', 'main-other'], generation: 8 };
@@ -79,6 +79,7 @@ test('does not create a missing index or operate on symbolic links', async () =>
   assert.equal(await cleanStaleSearch(':memory:', ids), true);
   assert.equal(await cleanStaleSearch(missing, ids), true);
   assert.throws(() => statSync(missing), { code: 'ENOENT' });
+  if (process.platform === 'win32') return; // Creating file symlinks needs a Windows privilege.
   const original = join(dir, 'native.sqlite');
   const link = join(dir, 'link.sqlite');
   fixture(original);

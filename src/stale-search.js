@@ -1,5 +1,5 @@
 import { lstatSync, realpathSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const nativeProvider = '@deepseek-ai/dsh-session-query-sqlite';
@@ -52,7 +52,7 @@ function ordinaryFile(stat) {
 function safeFile(path, original) {
   const current = lstatIfPresent(path);
   if (!current || !ordinaryFile(current) || current.ino !== original.ino || current.dev !== original.dev) return false;
-  if (realpathSync(path) !== path) return false;
+  if (relative(path, realpathSync(path)) !== '') return false;
   return ['-journal', '-wal', '-shm'].every((suffix) => {
     const sidecar = lstatIfPresent(path + suffix);
     return !sidecar || (ordinaryFile(sidecar) && sidecar.dev === original.dev);

@@ -1,9 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises';
+import { open, readFile, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { withDeleteLocks } from './delete-disk.js';
 import { captureDirectory, withDirectoryLocks } from './delete-tree.js';
-import { withFileLock } from './online-disk.js';
+import { directoryTree, withFileLock } from './online-disk.js';
+import { publishPath, syncDirectory } from './platform-fs.js';
 import { idleWebWriter, releaseIdleWebWriters } from './idle-web-writer.js';
 import { removeStaleProjection } from './stale-projection.js';
 import { cleanStaleSearch, configuredDisabledSearchPath } from './stale-search.js';
@@ -36,10 +37,8 @@ async function writeJournal(path, state) {
       await handle.writeFile(JSON.stringify(state), 'utf8');
       await handle.sync();
     } finally { await handle.close(); }
-    await rename(temporary, path);
-    const directory = await open(dirname(path), 'r');
-    try { await directory.sync(); }
-    finally { await directory.close(); }
+    await publishPath(temporary, path, { replace: true });
+    await syncDirectory(dirname(path));
   } catch (error) {
     await unlink(temporary).catch(() => {});
     throw error;
@@ -263,7 +262,7 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
         try { body = await request.json(); } catch { fail('bad-request'); }
         if (!validId(body?.id) || (body.action !== 'preview' && (body.action !== 'delete'
           || typeof body.ticket !== 'string' || body.ticket.length !== 36))) fail('bad-request');
-        await mkdir(dirname(journal), { recursive: true, mode: 0o700 });
+        await directoryTree(dirname(journal), true);
         const value = await withFileLock(`${journal}.lock`, async () => {
           // The exact fetch route already enforces DSH's owner admission policy.
           const entries = await readEntries(journal);

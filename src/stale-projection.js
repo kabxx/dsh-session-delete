@@ -1,7 +1,8 @@
 import { constants } from 'node:fs';
-import { open, unlink } from 'node:fs/promises';
+import { open, readdir, unlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { directoryTree, stat } from './online-disk.js';
+import { assertPlainWindowsPath, syncDirectory } from './platform-fs.js';
 
 const domainName = 'session_projcache';
 const safeKey = /^[a-zA-Z0-9_-]+$/u;
@@ -47,7 +48,7 @@ export async function removeStaleProjection(ctx, ids) {
   const backend = ctx.get('storage.backend.json');
   const root = ctx.dshHomePath('storages');
   if (!targets.length) return { removed: 0, skipped: 0 };
-  if (process.platform !== 'linux' || !canUseFallback(ctx, facility, backend, root)) {
+  if (!['linux', 'darwin', 'win32'].includes(process.platform) || !canUseFallback(ctx, facility, backend, root)) {
     return { removed: 0, skipped: targets.length };
   }
 
@@ -59,19 +60,25 @@ export async function removeStaleProjection(ctx, ids) {
     if (error.code === 'unsafe-path') return { removed: 0, skipped: targets.length };
     throw error;
   }
-  const table = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  const table = process.platform === 'linux'
+    ? await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW) : undefined;
   const result = { removed: 0, skipped: 0 };
   try {
-    const directory = await table.stat({ bigint: true });
+    const directory = table ? await table.stat({ bigint: true }) : expectedDirectory;
     if (directory.dev !== expectedDirectory.dev || directory.ino !== expectedDirectory.ino) {
       return { removed: 0, skipped: targets.length };
     }
+    // On case-insensitive volumes a differently cased key could resolve to the
+    // same path. Match the actual stored key, not the volume's name lookup.
+    const exactNames = table ? undefined : new Set(await readdir(path));
     for (const id of targets) {
       if (typeof id !== 'string' || id.length > 200 || !safeKey.test(id)) {
         result.skipped++;
         continue;
       }
-      const file = `/proc/self/fd/${table.fd}/${id}.json`;
+      const name = `${id}.json`;
+      if (exactNames && !exactNames.has(name)) continue;
+      const file = table ? `/proc/self/fd/${table.fd}/${name}` : join(path, name);
       const before = await stat(file);
       if (!before) continue;
       if (!before.isFile() || before.nlink !== 1n || before.dev !== directory.dev || before.size > maxBytes) {
@@ -80,10 +87,11 @@ export async function removeStaleProjection(ctx, ids) {
       }
       let handle;
       try {
+        assertPlainWindowsPath(file);
         handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       } catch (error) {
         if (error.code === 'ENOENT') continue;
-        if (error.code !== 'ELOOP') throw error;
+        if (!['ELOOP', 'unsafe-path'].includes(error.code)) throw error;
         result.skipped++;
         continue;
       }
@@ -96,17 +104,20 @@ export async function removeStaleProjection(ctx, ids) {
         // Read just the inspected size, so a concurrent append cannot make the read unbounded.
         const bytes = Buffer.alloc(Number(opened.size));
         const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-        if (bytesRead !== bytes.length || !isCheckpoint(bytes.toString('utf8'))
+        const parent = table ? directory : await directoryTree(path, false);
+        if (parent.dev !== directory.dev || parent.ino !== directory.ino
+          || bytesRead !== bytes.length || !isCheckpoint(bytes.toString('utf8'))
           || await ctx.sessionPersistence.stat(id)
           || !canUseFallback(ctx, facility, backend, root) || !sameFile(opened, await stat(file))) {
           result.skipped++;
           continue;
         }
         await unlink(file);
-        await table.sync();
+        if (table) await table.sync();
+        else await syncDirectory(path);
         result.removed++;
       } finally { await handle.close(); }
     }
     return result;
-  } finally { await table.close(); }
+  } finally { await table?.close(); }
 }

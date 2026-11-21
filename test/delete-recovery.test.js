@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import { createSessionDelete } from '../src/delete.js';
 import { captureDirectory, withDirectoryLocks } from '../src/delete-tree.js';
 
-const linuxTest = (name, body) => test(name, { skip: process.platform !== 'linux' }, body);
+const platformTest = (name, body) => test(name, { skip: process.platform !== 'linux' && !process.env.DSH_INSTALL_DIR }, body);
 
 async function fixture(t) {
   const base = await mkdtemp(join(await realpath(tmpdir()), 'dsh-delete-recovery-'));
@@ -73,7 +73,7 @@ async function confirm(request, id, count = 0) {
   return request('delete', id, preview.ticket);
 }
 
-linuxTest('failed record cleanup persists per group without blocking or retrying unrelated deletes', async (t) => {
+platformTest('failed record cleanup persists per group without blocking or retrying unrelated deletes', async (t) => {
   const f = await fixture(t);
   const request = f.start();
   f.failing.add('a-child');
@@ -101,7 +101,7 @@ linuxTest('failed record cleanup persists per group without blocking or retrying
   assert.deepEqual(f.attempts, ['a', 'a-child', 'b', 'c', 'a', 'a-child', 'a', 'a-child']);
 });
 
-linuxTest('keeps an older committed child deletion scoped during unrelated requests', async (t) => {
+platformTest('keeps an older committed child deletion scoped during unrelated requests', async (t) => {
   const f = await fixture(t);
   const id = 'a-child';
   const members = [await captureDirectory(f.root, id, f.locations.get(id))];

@@ -1,6 +1,9 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, rm, rmdir } from 'node:fs/promises';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { mkdir, readFile, readdir, rm, rmdir } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { assertPlainWindowsPath, publishPath } from './platform-fs.js';
 import { validateSessionLocation } from './disk-trash.js';
 import { directoryTree, isLog, lockSource, sameIdentity, sourcePath, stat, syncDirectory, verifySource } from './online-disk.js';
 
@@ -16,15 +19,53 @@ function identity(info) {
 }
 
 function contains(path, child) {
-  return child === path || child.startsWith(path + sep);
+  if (process.platform === 'darwin') {
+    path = path.normalize('NFC').toLowerCase();
+    child = child.normalize('NFC').toLowerCase();
+  }
+  const remainder = relative(path, child);
+  return remainder !== '..' && !remainder.startsWith(`..${sep}`) && !isAbsolute(remainder);
 }
 
 async function assertNoMounts(paths) {
-  const mountInfo = await readFile('/proc/self/mountinfo', 'utf8');
-  for (const line of mountInfo.trim().split('\n')) {
-    const mountPath = line.split(' ')[4]?.replace(/\\([0-7]{3})/gu, (_, octal) => String.fromCharCode(parseInt(octal, 8)));
-    if (!mountPath?.startsWith('/')) refuse('unsupported');
-    if (paths.some((path) => contains(path, mountPath))) refuse('cross-device');
+  let mounts;
+  if (process.platform === 'linux') {
+    const mountInfo = await readFile('/proc/self/mountinfo', 'utf8');
+    mounts = mountInfo.trimEnd().split('\n').map((line) => {
+      const path = line.split(' ')[4]?.replace(/\\([0-7]{3})/gu, (_, octal) => String.fromCharCode(parseInt(octal, 8)));
+      if (!path?.startsWith('/')) refuse('unsupported');
+      return path;
+    });
+  } else if (process.platform === 'darwin') {
+    const { stdout } = await promisify(execFile)('/sbin/mount', { timeout: 4000 });
+    mounts = stdout.trimEnd().split('\n').flatMap((line) => {
+      const end = line.lastIndexOf(' (');
+      if (end < 0 || !line.endsWith(')')) refuse('unsupported');
+      const prefix = line.slice(0, end);
+      const candidates = [...prefix.matchAll(/ on (?=\/)/gu)].map(({ index }) => prefix.slice(index + 4));
+      if (!candidates.length) refuse('unsupported');
+      return candidates;
+    });
+  } else if (process.platform === 'win32') {
+    // Win32 mount points and junctions are reparse points, checked before recursion.
+    return;
+  } else refuse('unsupported');
+  if (paths.some((path) => mounts.some((mount) => contains(path, mount)))) refuse('cross-device');
+}
+
+async function inspectDeletionTree(path, device) {
+  const pending = [path];
+  while (pending.length) {
+    const current = pending.pop();
+    const info = await stat(current);
+    if (!info) refuse('changed');
+    // Node unlinks symbolic links (including junctions) without traversing them.
+    if (info.isSymbolicLink()) continue;
+    assertPlainWindowsPath(current);
+    if (info.dev !== device) refuse('cross-device');
+    if (info.isDirectory()) {
+      for (const name of await readdir(current)) pending.push(join(current, name));
+    }
   }
 }
 
@@ -42,6 +83,7 @@ async function rolloutFingerprint(item) {
     if (!isLog(name)) continue;
     const info = await stat(join(item.source, name));
     if (!info?.isFile() || info.nlink !== 1n || info.dev !== item.device) refuse('unsafe-path');
+    assertPlainWindowsPath(join(item.source, name));
     files.push([name, String(info.ino), String(info.size), String(info.mtimeNs), String(info.ctimeNs)]);
   }
   if (!files.length) refuse('missing');
@@ -58,14 +100,16 @@ async function privateDirectory(path, device, create) {
     }
   }
   const info = await stat(path);
-  if (info && (!info.isDirectory() || info.dev !== device || info.uid !== BigInt(process.getuid())
-    || (info.mode & 0o077n) !== 0n)) refuse('unsafe-path');
+  if (info && (!info.isDirectory() || info.dev !== device)) refuse('unsafe-path');
+  if (info) assertPlainWindowsPath(path);
+  if (info && process.platform !== 'win32'
+    && (info.uid !== BigInt(process.getuid()) || (info.mode & 0o077n) !== 0n)) refuse('unsafe-path');
   return info;
 }
 
 /** Keep the original native lock until the entire verified directory is detached. */
 export async function withDirectoryLocks({ root, staging, members, transaction, previewResidents }, run) {
-  if (process.platform !== 'linux') refuse('unsupported');
+  if (!['linux', 'darwin', 'win32'].includes(process.platform)) refuse('unsupported');
   const committed = transaction !== undefined;
   if ((committed && !transactionId.test(transaction)) || !Array.isArray(members) || !members.length
     || members.some((member) => typeof member?.id !== 'string' || !identityPart.test(member.identity?.dev)
@@ -96,6 +140,7 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
       }
       if (!previewResidents?.has(item.member.id)) locks.push(await lockSource(item, device));
       item.files = await rolloutFingerprint(item);
+      await inspectDeletionTree(item.source, device);
       if (committed && (!sameIdentity(item.lockIdentity, item.member.lockIdentity)
         || JSON.stringify(item.files) !== JSON.stringify(item.member.files))) refuse('collision');
     }
@@ -115,7 +160,8 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
       }
       for (const item of items) {
         if (!item.files) continue;
-        await rename(item.source, item.detached);
+        await verifySource(item, device);
+        await publishPath(item.source, item.detached);
         await syncDirectory(dirname(item.source));
         await syncDirectory(transactionPath);
       }
@@ -124,7 +170,7 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
         const detached = await stat(item.detached);
         if (!detached) continue;
         if (!detached.isDirectory() || !sameIdentity(detached, item.member.identity)) refuse('collision');
-        // fs.rm unlinks symlinks inside this directory without visiting their targets.
+        await inspectDeletionTree(item.detached, device);
         await rm(item.detached, { recursive: true });
         await syncDirectory(transactionPath);
       }
