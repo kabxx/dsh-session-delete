@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import { createSessionDelete } from '../src/delete.js';
 import { captureDirectory, withDirectoryLocks } from '../src/delete-tree.js';
 import { acquirePathLock } from '../src/platform-fs.js';
+import manifest from '../package.json' with { type: 'json' };
 
 const platformTest = (name, body) => test(name, { skip: process.platform !== 'linux' && !process.env.DSH_INSTALL_DIR }, body);
 
@@ -211,7 +212,7 @@ platformTest('a fresh install does not create the legacy directory', async (t) =
     [200, { deleted: true, cleanupPending: true }]);
   await assert.rejects(lstat(join(legacy, '..')), { code: 'ENOENT' });
   const { entries: [entry] } = JSON.parse(await readFile(journal, 'utf8'));
-  assert.equal(entry.pluginVersion, '0.1.0');
+  assert.equal(entry.pluginVersion, manifest.version);
   assert.equal(entry.phase, 'committed');
 });
 
