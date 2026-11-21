@@ -12,7 +12,9 @@ window.__ModuleLoader__.load({
         scope: '将永久删除“{title}”，删除后无法恢复。',
         scopeWithChild: '将永久删除“{title}”及其 {count} 个子智能体会话，删除后无法恢复。',
         scopeWithChildren: '将永久删除“{title}”及其 {count} 个子智能体会话，删除后无法恢复。',
-        deleted: '会话已删除', cleanupPending: '会话已删除，部分索引记录待清理。',
+        deleted: '会话已删除', cleanupPending: '删除已提交，清理待完成。',
+        restored: '删除失败，已恢复。', 'restore-pending': '删除失败，恢复未完成。',
+        'recovery-pending': '未能确认删除结果，等待恢复处理。', 'cleanup-pending': '删除已提交，清理待完成。',
         busy: '会话运行中，请先停止。', locked: '会话正被占用，暂时无法删除。',
         missing: '未找到该会话。', changed: '会话状态已变更，请重试。',
         unsupported: '当前存储方式不支持删除会话。', 'unsafe-path': '会话文件路径异常。',
@@ -25,7 +27,10 @@ window.__ModuleLoader__.load({
         scope: '“{title}” will be permanently deleted. This cannot be undone.',
         scopeWithChild: '“{title}” and its {count} subagent session will be permanently deleted. This cannot be undone.',
         scopeWithChildren: '“{title}” and its {count} subagent sessions will be permanently deleted. This cannot be undone.',
-        deleted: 'Session deleted', cleanupPending: 'Session deleted; some index records remain.',
+        deleted: 'Session deleted', cleanupPending: 'Deletion committed. Cleanup is pending.',
+        restored: 'Deletion failed. Sessions were restored.', 'restore-pending': 'Deletion failed. Restoration is pending.',
+        'recovery-pending': 'Deletion result could not be confirmed. Recovery is pending.',
+        'cleanup-pending': 'Deletion committed. Cleanup is pending.',
         busy: 'Session is running. Stop it first.', locked: 'Session is in use and cannot be deleted right now.',
         missing: 'Session not found.', changed: 'Session state changed. Try again.',
         unsupported: 'Session deletion is not supported for this storage.', 'unsafe-path': 'Invalid session file path.',
@@ -35,6 +40,7 @@ window.__ModuleLoader__.load({
     };
     const errors = new Set([
       'busy', 'locked', 'missing', 'changed', 'unsupported', 'unsafe-path', 'dependent-fork', 'authentication-required',
+      'restored', 'restore-pending', 'recovery-pending', 'cleanup-pending',
     ]);
     const dangerColor = 'var(--dsw-alias-state-error-primary)';
     const danger = { color: dangerColor };

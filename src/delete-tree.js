@@ -3,7 +3,7 @@ import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import { mkdir, readFile, readdir, rm, rmdir } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { assertPlainWindowsPath, publishPath } from './platform-fs.js';
+import { acquirePathLock, assertPlainWindowsPath, publishPath, restorePath, verifyPathLock } from './platform-fs.js';
 import { validateSessionLocation } from './disk-trash.js';
 import { directoryTree, isLog, lockSource, sameIdentity, sourcePath, stat, syncDirectory, verifySource } from './online-disk.js';
 
@@ -108,10 +108,11 @@ async function privateDirectory(path, device, create) {
 }
 
 /** Keep the original native lock until the entire verified directory is detached. */
-export async function withDirectoryLocks({ root, staging, members, transaction, previewResidents }, run) {
+export async function withDirectoryLocks({ root, staging, members, transaction, phase, previewResidents }, run) {
   if (!['linux', 'darwin', 'win32'].includes(process.platform)) refuse('unsupported');
   const committed = transaction !== undefined;
-  if ((committed && !transactionId.test(transaction)) || !Array.isArray(members) || !members.length
+  if ((phase !== undefined && (!committed || !['prepared', 'committed'].includes(phase)))
+    || (committed && !transactionId.test(transaction)) || !Array.isArray(members) || !members.length
     || members.some((member) => typeof member?.id !== 'string' || !identityPart.test(member.identity?.dev)
       || !identityPart.test(member.identity?.ino)) || new Set(members.map(({ id }) => id)).size !== members.length) {
     refuse('bad-state');
@@ -122,6 +123,7 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
   const transactionPath = join(staging, transaction ?? randomUUID());
   const items = structuredClone(members).map((member, index) => ({
     member, device, source: sourcePath(root, member), detached: join(transactionPath, String(index)),
+    replacement: join(transactionPath, `${index}.replacement`),
   }));
   const locks = [];
   try {
@@ -133,6 +135,11 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
       if (detached && (!committed || !detached.isDirectory() || !sameIdentity(detached, item.member.identity))) refuse('collision');
       if ((await directoryTree(dirname(item.source), false)).dev !== device) refuse('cross-device');
       const current = await stat(item.source);
+      if (phase === 'prepared') continue;
+      if (phase === 'committed') {
+        if (sameIdentity(current, item.member.identity)) refuse('collision');
+        continue;
+      }
       if (detached || (committed && !current)) continue;
       if (!sameIdentity(current, item.member.identity)) {
         if (committed) continue;
@@ -146,9 +153,7 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
     }
     const fingerprint = JSON.stringify(items.map(({ member, files }) => [member.id, files]));
     const plan = items.map(({ member, files, lockIdentity }) => ({ ...member, files, lockIdentity }));
-    return await run({ fingerprint, async remove(commit) {
-      if (previewResidents) refuse('bad-state');
-      if (!committed) await commit({ members: plan, transaction: basename(transactionPath) });
+    async function detach() {
       await assertNoMounts([staging, ...items.map(({ source }) => source)]);
       await privateDirectory(staging, device, true);
       await privateDirectory(transactionPath, device, true);
@@ -165,6 +170,12 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
         await syncDirectory(dirname(item.source));
         await syncDirectory(transactionPath);
       }
+      await syncDirectory(staging);
+      await syncDirectory(dirname(staging));
+    }
+
+    async function clearStaging() {
+      if (!await privateDirectory(transactionPath, device, false)) return;
       await assertNoMounts([transactionPath]);
       for (const item of items) {
         const detached = await stat(item.detached);
@@ -176,6 +187,91 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
       }
       await rmdir(transactionPath);
       await syncDirectory(staging);
+    }
+
+    async function rollback() {
+      if (phase !== 'prepared') refuse('bad-state');
+      for (const item of [...items].reverse()) {
+        const detached = await stat(item.detached);
+        if (detached) {
+          if (!detached.isDirectory() || !sameIdentity(detached, item.member.identity)) refuse('collision');
+          const movedItem = { ...item, source: item.detached };
+          const restore = async () => {
+            if (JSON.stringify(await rolloutFingerprint(movedItem)) !== JSON.stringify(item.member.files)) refuse('changed');
+            if (!sameIdentity(await stat(item.detached), item.member.identity)) refuse('collision');
+            const discardReplacement = async (sourceIdentity, lockIdentity) => {
+              await assertNoMounts([item.replacement]);
+              await inspectDeletionTree(item.replacement, device);
+              if (!sameIdentity(await stat(item.replacement), sourceIdentity)) refuse('collision');
+              if (lockIdentity) await verifyPathLock(join(item.replacement, 'session.lock'), lockIdentity);
+              await rm(item.replacement, { recursive: true });
+              await syncDirectory(transactionPath);
+            };
+            const posix = process.platform !== 'win32';
+            // Windows already holds the original path's semaphore throughout restore.
+            // On POSIX the replacement has its own lock inode, distinct from the original.
+            const stagedReplacement = await stat(item.replacement);
+            if (stagedReplacement) {
+              if (!stagedReplacement.isDirectory() || stagedReplacement.dev !== device) refuse('unsafe-path');
+              assertPlainWindowsPath(item.replacement);
+              const conflict = { source: item.replacement, sourceIdentity: identity(stagedReplacement) };
+              if (posix) locks.push(await lockSource(conflict, device));
+              await discardReplacement(conflict.sourceIdentity, conflict.lockIdentity);
+            }
+            const occupant = await stat(item.source);
+            if (occupant) {
+              if (!occupant.isDirectory() || occupant.dev !== device) refuse('unsafe-path');
+              assertPlainWindowsPath(item.source);
+              await assertNoMounts([item.source]);
+              const conflict = { source: item.source, sourceIdentity: identity(occupant) };
+              if (posix) {
+                locks.push(await lockSource(conflict, device));
+                await verifySource(conflict, device);
+              } else if (!sameIdentity(await stat(item.source), conflict.sourceIdentity)) refuse('collision');
+              await publishPath(item.source, item.replacement);
+              await syncDirectory(dirname(item.source));
+              await syncDirectory(transactionPath);
+              await discardReplacement(conflict.sourceIdentity, conflict.lockIdentity);
+            }
+            await restorePath(item.detached, item.source);
+            await syncDirectory(transactionPath);
+          };
+          if (process.platform === 'win32') {
+            // The DSH semaphore is keyed by the original path, even while that directory is absent.
+            const { handle } = await acquirePathLock(join(item.source, 'session.lock'));
+            try { await restore(); }
+            finally { await handle.close(); }
+          } else {
+            const handle = await lockSource(movedItem, device);
+            try {
+              if (!sameIdentity(movedItem.lockIdentity, item.member.lockIdentity)) refuse('collision');
+              await restore();
+            } finally { await handle.close(); }
+          }
+        }
+        if (!sameIdentity(await stat(item.source), item.member.identity)) refuse('collision');
+        await syncDirectory(dirname(item.source));
+      }
+      if (await privateDirectory(transactionPath, device, false)) await rmdir(transactionPath);
+      if (await privateDirectory(staging, device, false)) await syncDirectory(staging);
+    }
+
+    return await run({ fingerprint, rollback, async remove(callbacks) {
+      if (previewResidents || phase === 'prepared') refuse('bad-state');
+      if (phase !== 'committed') {
+        if (!committed) {
+          const prepare = typeof callbacks === 'function' ? callbacks : callbacks.prepare;
+          await prepare({ members: plan, transaction: basename(transactionPath) });
+        }
+        await detach();
+        if (!committed && typeof callbacks !== 'function') {
+          for (const item of items) {
+            if (!sameIdentity(await stat(item.detached), item.member.identity)) refuse('collision');
+          }
+          await callbacks.commit();
+        }
+      }
+      await clearStaging();
     } });
   } finally {
     await Promise.allSettled(locks.reverse().map((handle) => handle.close()));

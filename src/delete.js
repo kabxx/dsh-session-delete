@@ -15,7 +15,8 @@ const maxTickets = 64;
 const settlementBudget = 1200;
 const knownErrors = new Set([
   'busy', 'locked', 'unsupported', 'unsafe-path', 'cross-device', 'collision', 'missing',
-  'changed', 'dependent-fork', 'cleanup-pending', 'authentication-required', 'bad-request',
+  'changed', 'dependent-fork', 'cleanup-pending', 'restore-pending', 'recovery-pending', 'restored',
+  'authentication-required', 'bad-request',
 ]);
 
 function fail(code) {
@@ -48,7 +49,8 @@ async function writeJournal(path, state) {
 }
 
 function validateEntry(entry) {
-  if (![1, 2].includes(entry?.version) || (entry.version === 2 && typeof entry.transaction !== 'string')
+  if (![1, 2, 3].includes(entry?.version) || (entry.version >= 2 && typeof entry.transaction !== 'string')
+    || (entry.version === 3 && !['prepared', 'committed'].includes(entry.phase))
     || !Array.isArray(entry.members) || entry.members.length === 0
     || entry.members.some((member) => !validId(member?.id))) fail('cleanup-pending');
   return entry;
@@ -57,12 +59,12 @@ function validateEntry(entry) {
 async function readEntries(journal) {
   const state = await readJson(journal);
   if (state === undefined || ([1, 2].includes(state?.version) && state.members === null)) return [];
-  if (state?.version === 3 && Array.isArray(state.entries)) return state.entries.map(validateEntry);
+  if ([3, 4].includes(state?.version) && Array.isArray(state.entries)) return state.entries.map(validateEntry);
   return [validateEntry(state)];
 }
 
 function writeEntries(journal, entries) {
-  return writeJournal(journal, { version: 3, entries });
+  return writeJournal(journal, { version: 4, entries });
 }
 
 /** Follow durable creator edges. A normal fork can name the same parent. */
@@ -188,27 +190,37 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
     await removeNativeRecords(members);
   }
 
-  async function recoverForPreview(id, entries) {
-    const entry = entries.find(({ members }) => members.some((member) => member.id === id));
-    if (!entry) return entries;
+  async function recoverEntry(entry, entries) {
     const remaining = entries.filter((pending) => pending !== entry);
     try {
-      const complete = async (lease) => {
-        await assertInactive(entry.members.map(({ id }) => id));
-        await lease.remove();
-        await finish(entry.members);
-        await writeEntries(journal, remaining);
-      };
-      if (entry.version === 1) {
-        await withDeleteLocks({ root, members: entry.members, committed: true }, complete);
+      // A prior rename of the journal may have succeeded before directory fsync failed.
+      // Make the visible decision durable before acting on it.
+      await syncDirectory(dirname(journal));
+      if (entry.phase === 'prepared') {
+        await withDirectoryLocks({ root, staging, ...entry }, (lease) => lease.rollback());
       } else {
-        await withDirectoryLocks({ root, staging, members: entry.members, transaction: entry.transaction }, complete);
+        const complete = async (lease) => {
+          await assertInactive(entry.members.map(({ id }) => id));
+          await lease.remove();
+          await finish(entry.members);
+        };
+        if (entry.version === 1) {
+          await withDeleteLocks({ root, members: entry.members, committed: true }, complete);
+        } else {
+          await withDirectoryLocks({ root, staging, ...entry }, complete);
+        }
       }
+      await writeEntries(journal, remaining);
     } catch (error) {
       ctx.logger.warn('Session delete recovery: %s', error);
-      fail('cleanup-pending');
+      fail(entry.phase === 'prepared' ? 'restore-pending' : 'cleanup-pending');
     }
     return remaining;
+  }
+
+  async function recoverForPreview(id, entries) {
+    const entry = entries.find(({ members }) => members.some((member) => member.id === id));
+    return entry ? recoverEntry(entry, entries) : entries;
   }
 
   function sessionCookie(request) {
@@ -244,28 +256,53 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
         return releaseIdleWebWriters(ctx, writers);
       });
     }
-    let diskRemoved = false;
+    let prepared;
+    let committing = false;
+    let committed = false;
     try {
       await withDirectoryLocks({ root, staging, members }, async (lease) => {
         if (expected.files !== lease.fingerprint) fail('changed');
-        await lease.remove(async (plan) => {
-          if (!samePlan(members, (await describe(id, entries)).members)) fail('changed');
-          request.signal.throwIfAborted();
-          await writeEntries(journal, [...entries, { version: 2, ...plan }]);
+        await lease.remove({
+          async prepare(plan) {
+            if (!samePlan(members, (await describe(id, entries)).members)) fail('changed');
+            request.signal.throwIfAborted();
+            const entry = { version: 3, phase: 'prepared', ...plan };
+            await writeEntries(journal, [...entries, entry]);
+            prepared = entry;
+          },
+          async commit() {
+            request.signal.throwIfAborted();
+            committing = true;
+            await writeEntries(journal, [...entries, { ...prepared, phase: 'committed' }]);
+            committed = true;
+          },
         });
-        diskRemoved = true;
         await finish(members);
         await writeEntries(journal, entries);
       });
     } catch (error) {
-      if (!diskRemoved) throw error;
-      ctx.logger.warn('Session delete record cleanup: %s', error);
-      return { deleted: true, cleanupPending: true };
+      if (!prepared) throw error;
+      if (committed) {
+        ctx.logger.warn('Session delete committed cleanup: %s', error);
+        return { deleted: true, cleanupPending: true };
+      }
+      if (committing) {
+        // Do not guess which marker persisted if publication or its fsync failed.
+        ctx.logger.warn('Session delete commit: %s', error);
+        fail('recovery-pending');
+      }
+      await recoverEntry(prepared, [...entries, prepared]);
+      fail('restored');
     }
     return { deleted: true };
   }
 
-  return (request) => {
+  async function withJournal(run) {
+    await directoryTree(dirname(journal), true);
+    return withFileLock(`${journal}.lock`, async () => run(await readEntries(journal)));
+  }
+
+  const handle = (request) => {
     const result = chain.then(async () => {
       const headers = { 'Cache-Control': 'no-store' };
       try {
@@ -276,11 +313,9 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
         try { body = await request.json(); } catch { fail('bad-request'); }
         if (!validId(body?.id) || (body.action !== 'preview' && (body.action !== 'delete'
           || typeof body.ticket !== 'string' || body.ticket.length !== 36))) fail('bad-request');
-        await directoryTree(dirname(journal), true);
-        const value = await withFileLock(`${journal}.lock`, async () => {
+        const value = await withJournal(async (entries) => {
           // The exact fetch route already enforces DSH's owner admission policy.
-          const entries = await readEntries(journal);
-          // Only a preview for a member of a previously confirmed group may resume its cleanup.
+          // Only a preview for a member of a previously confirmed group may resume its recovery.
           if (body.action === 'preview') return preview(body.id, request, await recoverForPreview(body.id, entries));
           return remove(body.id, body.ticket, request, entries);
         });
@@ -295,4 +330,20 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
     chain = result.then(() => {}, () => {});
     return result;
   };
+  handle.recoverPending = (signal) => {
+    const result = chain.then(async () => {
+      // Only the new, explicit phase records get unattended recovery.
+      if (!await stat(journal).catch((error) => { if (error.code === 'ENOENT') return; throw error; })) return;
+      await withJournal(async (entries) => {
+        for (const entry of entries.filter(({ version }) => version === 3)) {
+          if (signal?.aborted) break;
+          try { entries = await recoverEntry(entry, entries); }
+          catch { /* The failure is recorded and isolated to this group. */ }
+        }
+      });
+    });
+    chain = result.then(() => {}, () => {});
+    return result;
+  };
+  return handle;
 }

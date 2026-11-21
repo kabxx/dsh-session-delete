@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { appendFile, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { createSessionDelete } from '../src/delete.js';
 import { captureDirectory, withDirectoryLocks } from '../src/delete-tree.js';
+import { acquirePathLock } from '../src/platform-fs.js';
 
 const platformTest = (name, body) => test(name, { skip: process.platform !== 'linux' && !process.env.DSH_INSTALL_DIR }, body);
 
@@ -64,12 +65,12 @@ async function fixture(t) {
   };
   const start = () => {
     const handle = createSessionDelete(ctx, options);
-    return async (action, id, ticket) => {
+    return Object.assign(async (action, id, ticket) => {
       const response = await handle(new Request('http://localhost/api/session-delete/session', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, id, ticket }),
       }));
       return [response.status, await response.json()];
-    };
+    }, { recover: handle.recoverPending });
   };
   const readJournal = async () => JSON.parse(await readFile(journal, 'utf8'));
   function webResident(id) {
@@ -149,14 +150,164 @@ platformTest('keeps an older committed child deletion scoped during unrelated re
   assert.deepEqual(await request('preview', 'a'), [409, { error: 'cleanup-pending' }]);
   assert.deepEqual(await confirm(request, 'b'), [200, { deleted: true }]);
   assert.ok(await f.stat(id));
-  assert.deepEqual(await f.readJournal(), { version: 3, entries: [oldEntry] });
+  assert.deepEqual(await f.readJournal(), { version: 4, entries: [oldEntry] });
   assert.deepEqual(f.attempts, ['b']);
 
   assert.deepEqual(await request('preview', id), [409, { error: 'missing' }]);
   assert.equal(await f.stat(id), undefined);
   assert.ok(await f.stat('a'));
-  assert.deepEqual(await f.readJournal(), { version: 3, entries: [] });
+  assert.deepEqual(await f.readJournal(), { version: 4, entries: [] });
   assert.deepEqual(f.attempts, ['b', id]);
+});
+
+async function recordInterruptedGroup(f, phase) {
+  const ids = ['a', 'a-child'];
+  const members = await Promise.all(ids.map((id) => captureDirectory(f.root, id, f.locations.get(id))));
+  const staging = join(f.base, 'directory-deletion');
+  let transaction;
+  await assert.rejects(withDirectoryLocks({ root: f.root, staging, members }, (lease) => lease.remove({
+    async prepare(plan) {
+      transaction = join(staging, plan.transaction);
+      const entry = { version: 3, phase, ...plan };
+      if (phase === 'prepared') {
+        await writeFile(f.journal, JSON.stringify({ version: 4, entries: [entry] }));
+      } else {
+        lease.entry = entry;
+      }
+    },
+    async commit() {
+      if (lease.entry) await writeFile(f.journal, JSON.stringify({ version: 4, entries: [lease.entry] }));
+      throw new Error('simulated interruption before cleanup');
+    },
+  })), /simulated interruption/u);
+  return transaction;
+}
+
+platformTest('rollback defers recovery while an already detached replacement still has a writer', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'prepared');
+  const child = f.locations.get('a-child').path;
+  const replacement = join(child, '..');
+  const detachedReplacement = join(transaction, '1.replacement');
+  await mkdir(replacement);
+  await writeFile(child, 'replacement rollout');
+  await writeFile(join(replacement, 'session.lock'), '');
+  const writer = await acquirePathLock(join(replacement, 'session.lock'));
+  try {
+    // A previous version could move the replacement without taking its lock.
+    await rename(replacement, detachedReplacement);
+    await f.start().recover();
+    assert.equal((await f.readJournal()).entries[0].phase, 'prepared');
+    assert.equal(await readFile(join(detachedReplacement, 'session.v4.jsonl'), 'utf8'), 'replacement rollout');
+    assert.equal(await readFile(join(transaction, '1', 'session.v4.jsonl'), 'utf8'), 'a-child');
+    await assert.rejects(lstat(replacement), { code: 'ENOENT' });
+  } finally {
+    await writer.handle.close();
+  }
+  await f.start().recover();
+  assert.equal(await readFile(child, 'utf8'), 'a-child');
+  assert.deepEqual((await f.readJournal()).entries, []);
+});
+
+platformTest('startup rolls back a partly staged group and preserves every rollout', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'prepared');
+  const child = f.locations.get('a-child').path;
+  await rename(join(transaction, '1'), join(child, '..'));
+  assert.equal(await f.stat('a'), undefined);
+  await f.start().recover();
+  assert.equal(await readFile(f.locations.get('a').path, 'utf8'), 'a');
+  assert.equal(await readFile(child, 'utf8'), 'a-child');
+  assert.deepEqual((await f.readJournal()).entries, []);
+  assert.deepEqual(f.attempts, []);
+});
+
+platformTest('startup retries a committed group without restoring staged files', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'committed');
+  await rm(join(transaction, '0'), { recursive: true });
+  await f.start().recover();
+  assert.equal(await f.stat('a'), undefined);
+  assert.equal(await f.stat('a-child'), undefined);
+  assert.deepEqual((await f.readJournal()).entries, []);
+  assert.deepEqual(f.attempts, ['a', 'a-child']);
+});
+
+platformTest('rollback waits for a replacement directory writer before removing it', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'prepared');
+  const child = f.locations.get('a-child').path;
+  const replacement = join(child, '..');
+  await mkdir(replacement);
+  await writeFile(child, 'replacement rollout');
+  await writeFile(join(replacement, 'session.lock'), '');
+  const writer = await acquirePathLock(join(replacement, 'session.lock'));
+  try {
+    await f.start().recover();
+    assert.equal((await f.readJournal()).entries[0].phase, 'prepared');
+    assert.equal(await readFile(child, 'utf8'), 'replacement rollout');
+    await appendFile(child, '\nnew message');
+    assert.equal(await readFile(child, 'utf8'), 'replacement rollout\nnew message');
+    assert.equal(await readFile(join(transaction, '1', 'session.v4.jsonl'), 'utf8'), 'a-child');
+  } finally {
+    await writer.handle.close();
+  }
+  await f.start().recover();
+  assert.equal(await readFile(child, 'utf8'), 'a-child');
+  assert.deepEqual((await f.readJournal()).entries, []);
+});
+
+platformTest('rollback replaces a nonempty directory at the original path and keeps its link target', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'prepared');
+  const child = f.locations.get('a-child').path;
+  const replacement = join(child, '..');
+  const extra = join(replacement, 'nested', 'extra.txt');
+  const control = f.locations.get('b').path;
+  await mkdir(join(extra, '..'), { recursive: true });
+  await writeFile(child, 'replacement rollout');
+  await writeFile(extra, 'replacement data');
+  await symlink(join(control, '..'), join(replacement, 'linked-session'), 'junction');
+
+  await f.start().recover();
+  assert.equal(await readFile(f.locations.get('a').path, 'utf8'), 'a');
+  assert.equal(await readFile(child, 'utf8'), 'a-child');
+  assert.equal(await readFile(control, 'utf8'), 'b');
+  await assert.rejects(lstat(extra), { code: 'ENOENT' });
+  await assert.rejects(lstat(transaction), { code: 'ENOENT' });
+  assert.deepEqual((await f.readJournal()).entries, []);
+  assert.deepEqual(f.attempts, []);
+});
+
+platformTest('rollback resumes after moving a replacement out of the original path', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'prepared');
+  const child = f.locations.get('a-child').path;
+  const replacement = join(child, '..');
+  await mkdir(replacement);
+  await writeFile(child, 'replacement rollout');
+  // Simulate stopping after the conflict was moved aside, before discarding it.
+  await rename(replacement, join(transaction, '1.replacement'));
+
+  await f.start().recover();
+  assert.equal(await readFile(f.locations.get('a').path, 'utf8'), 'a');
+  assert.equal(await readFile(child, 'utf8'), 'a-child');
+  await assert.rejects(lstat(transaction), { code: 'ENOENT' });
+  assert.deepEqual((await f.readJournal()).entries, []);
+});
+
+platformTest('rollback preserves the replacement if the staged rollout fails verification', async (t) => {
+  const f = await fixture(t);
+  const transaction = await recordInterruptedGroup(f, 'prepared');
+  const child = f.locations.get('a-child').path;
+  await mkdir(join(child, '..'));
+  await writeFile(child, 'replacement rollout');
+  await writeFile(join(transaction, '1', 'session.v4.jsonl'), 'changed staged rollout');
+
+  await f.start().recover();
+  assert.equal(await readFile(child, 'utf8'), 'replacement rollout');
+  assert.equal((await f.readJournal()).entries[0].phase, 'prepared');
+  assert.deepEqual(await confirm(f.start(), 'b'), [200, { deleted: true }]);
 });
 
 platformTest('a managed child can finish native settlement while deletion prepares', async (t) => {
