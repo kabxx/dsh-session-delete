@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { open, readFile, stat, unlink } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { withDeleteLocks } from './delete-disk.js';
 import { captureDirectory, withDirectoryLocks } from './delete-tree.js';
 import { directoryTree, withFileLock } from './online-disk.js';
@@ -11,6 +12,7 @@ import { cleanStaleSearch, configuredDisabledSearchPath } from './stale-search.j
 
 const ticketLifetime = 5 * 60_000;
 const maxTickets = 64;
+const settlementBudget = 1200;
 const knownErrors = new Set([
   'busy', 'locked', 'unsupported', 'unsafe-path', 'cross-device', 'collision', 'missing',
   'changed', 'dependent-fork', 'cleanup-pending', 'authentication-required', 'bad-request',
@@ -111,12 +113,24 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
     });
   }
 
-  async function describe(id, entries, allowResident = false) {
-    const stored = await ctx.sessionPersistence.list();
-    const ids = scope(id, stored, ctx.sessions.list());
-    const targets = new Set(ids);
-    if (entries.some(({ members }) => members.some(({ id }) => targets.has(id)))) fail('cleanup-pending');
-    const writers = await assertInactive(ids, allowResident);
+  async function describe(id, entries, signal) {
+    const deadline = performance.now() + settlementBudget;
+    let stored;
+    let ids;
+    let targets;
+    let writers;
+    do {
+      signal?.throwIfAborted();
+      stored = await ctx.sessionPersistence.list();
+      ids = scope(id, stored, ctx.sessions.list());
+      targets = new Set(ids);
+      if (entries.some(({ members }) => members.some(({ id }) => targets.has(id)))) fail('cleanup-pending');
+      writers = await assertInactive(ids, Boolean(signal));
+      if (!writers.some(({ settling }) => settling)) break;
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) fail('locked');
+      await delay(Math.min(50, remaining), undefined, { signal });
+    } while (true);
     if (stored.some(({ header, formatStatus }) => formatStatus === 'migration-required'
       && !targets.has(header.id) && targets.has(header.parentSession))) fail('dependent-fork');
     const legacy = await readJson(legacyTrash);
@@ -202,10 +216,10 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
   }
 
   async function preview(id, request, entries) {
-    const { members, writers } = await describe(id, entries, true);
+    const { members, writers } = await describe(id, entries, request.signal);
     const previewResidents = new Set(writers.map(({ session }) => session.id));
     return withDirectoryLocks({ root, staging, members, previewResidents }, async (lease) => {
-      const current = await describe(id, entries, true);
+      const current = await describe(id, entries, request.signal);
       if (!samePlan(members, current.members) || current.writers.some(({ session }) => !previewResidents.has(session.id))) fail('changed');
       const ticket = randomUUID();
       const now = Date.now();
@@ -220,7 +234,7 @@ export function createSessionDelete(ctx, { root, journal, legacyTrash }) {
     const expected = tickets.get(ticket);
     if (expected?.id !== id || expected.expires <= Date.now() || expected.cookie !== sessionCookie(request)) fail('changed');
     tickets.delete(ticket);
-    const { members, writers } = await describe(id, entries, true);
+    const { members, writers } = await describe(id, entries, request.signal);
     if (!samePlan(expected.members, members)) fail('changed');
     if (writers.length > 0) {
       const previewResidents = new Set(writers.map(({ session }) => session.id));

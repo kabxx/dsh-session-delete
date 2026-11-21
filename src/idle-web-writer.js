@@ -12,13 +12,27 @@ function uniqueEffect(fiber, label) {
   if (matches.length === 1) return matches[0];
 }
 
+function assertNoWork(agent) {
+  if (agent.status === 'running' || agent.phase?.kind === 'maintenance' || agent.inbox?.hasPending === true) refuse('busy');
+  if (agent.status !== 'idle' || agent.phase?.kind !== 'idle' || agent.inbox?.hasPending !== false) refuse('locked');
+}
+
 /** The pinned DSH release stores Web Agent lifetime on the Session Controller fiber. */
 export function idleWebWriter(ctx, session) {
   const agent = ctx.get('agents')?.get(session.id);
   if (agent?.session !== session) refuse('locked');
-  if (agent.status === 'running' || agent.phase?.kind === 'maintenance' || agent.inbox?.hasPending === true) refuse('busy');
-  if (agent.status !== 'idle' || agent.phase?.kind !== 'idle' || agent.inbox?.hasPending !== false
-    || agent.lifetimeSignal?.aborted !== false || session.header.origin === 'subagent') refuse('locked');
+  const subagents = ctx.get('subagents');
+  const manager = (subagents?.[original] ?? subagents)?.manager;
+  const activation = manager?.resident?.get(session.id);
+  if (session.header.origin === 'subagent' && activation?.kind === 'local' && activation.handle?.agent === agent) {
+    // The manager already owns settlement and may notify the parent on close.
+    // Wait for that native transition without cancelling or disposing the child.
+    if (!activation.accepted || agent.inbox?.hasPending !== false || agent.status !== 'idle') refuse('busy');
+    if (activation.closing === undefined && agent.phase?.kind !== 'idle') refuse('busy');
+    return { session, agent, settling: true };
+  }
+  assertNoWork(agent);
+  if (agent.lifetimeSignal?.aborted !== false || session.header.origin === 'subagent') refuse('locked');
 
   const service = ctx.get('sessionController');
   const controller = service?.[original] ?? service;

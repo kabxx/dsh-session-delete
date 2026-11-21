@@ -36,9 +36,15 @@ async function fixture(t) {
   }
   const failing = new Set();
   const attempts = [];
+  const residents = new Map();
+  const activations = new Map();
+  const owner = { _disposables: [] };
+  const loop = { _disposables: [] };
+  const controllerContext = { fiber: owner };
+  const controller = { ctx: controllerContext, agents: { ctx: controllerContext, claims: new Map(), resumes: new Map() } };
   const ctx = {
     workspaceRegistry: { list: () => [], unpinSession() {}, unarchiveSession() {} },
-    sessions: { list: () => [] },
+    sessions: { list: () => [...residents.values()].map(({ session }) => session), get: (id) => residents.get(id)?.session },
     sessionPersistence: { stat, async list() {
       return (await Promise.all(headers.map(async (header) => (await stat(header.id)) && { header }))).filter(Boolean);
     } },
@@ -46,6 +52,9 @@ async function fixture(t) {
     emit() {},
     logger: { warn() {} },
     get(name) {
+      if (name === 'agents') return residents;
+      if (name === 'subagents') return { manager: { resident: activations } };
+      if (name === 'sessionController') return controller;
       if (name !== 'storageDomain') return undefined;
       return { get: () => ({ table: () => ({ async delete(id) {
         attempts.push(id);
@@ -63,7 +72,28 @@ async function fixture(t) {
     };
   };
   const readJournal = async () => JSON.parse(await readFile(journal, 'utf8'));
-  return { root, base, journal, locations, stat, failing, attempts, start, readJournal };
+  function webResident(id) {
+    const effect = Symbol.for('cordis.effect');
+    const label = `agentLoop.lifecycle(${id})`;
+    const addCallback = () => {
+      const callback = () => assert.fail('An ambiguous owner must not be released');
+      callback[effect] = { label, children: [] };
+      owner._disposables.push(callback);
+    };
+    addCallback();
+    const rawDispose = () => {};
+    rawDispose[effect] = { label: 'scope', children: [] };
+    const dispose = () => assert.fail('The underlying scope must not be disposed directly');
+    dispose[effect] = { label: `agentLoop.scope(${id})`, children: [rawDispose[effect]] };
+    loop._disposables.push(dispose);
+    const agent = {
+      session: { id, header: { id } }, status: 'idle', phase: { kind: 'idle' }, inbox: { hasPending: false },
+      scope: { rawDispose }, loopCtx: { fiber: loop }, lifetimeSignal: new AbortController().signal,
+    };
+    residents.set(id, agent);
+    return { agent, addCallback };
+  }
+  return { root, base, journal, locations, stat, failing, attempts, residents, activations, start, readJournal, webResident };
 }
 
 async function confirm(request, id, count = 0) {
@@ -127,4 +157,68 @@ platformTest('keeps an older committed child deletion scoped during unrelated re
   assert.ok(await f.stat('a'));
   assert.deepEqual(await f.readJournal(), { version: 3, entries: [] });
   assert.deepEqual(f.attempts, ['b', id]);
+});
+
+platformTest('a managed child can finish native settlement while deletion prepares', async (t) => {
+  const f = await fixture(t);
+  const child = 'a-child';
+  const agent = {
+    session: { id: child, header: { id: child, origin: 'subagent', parentSession: 'a' } },
+    status: 'idle', phase: { kind: 'idle' }, inbox: { hasPending: false },
+  };
+  f.residents.set(child, agent);
+  let observed = false;
+  f.activations.set(child, {
+    kind: 'local', handle: { agent },
+    get accepted() {
+      if (!observed) {
+        observed = true;
+        setImmediate(() => {
+          f.residents.delete(child);
+          f.activations.delete(child);
+        });
+      }
+      return true;
+    },
+  });
+  assert.deepEqual(await confirm(f.start(), 'a', 1), [200, { deleted: true }]);
+  assert.ok(observed);
+  assert.equal(await f.stat(child), undefined);
+});
+
+platformTest('a managed child with queued input still blocks the whole group', async (t) => {
+  const f = await fixture(t);
+  const child = 'a-child';
+  const agent = {
+    session: { id: child, header: { id: child, origin: 'subagent', parentSession: 'a' } },
+    status: 'idle', phase: { kind: 'idle' }, inbox: { hasPending: true },
+  };
+  f.residents.set(child, agent);
+  f.activations.set(child, { kind: 'local', accepted: true, handle: { agent } });
+  assert.deepEqual(await f.start()('preview', 'a'), [409, { error: 'busy' }]);
+  assert.ok(await f.stat(child));
+  assert.ok(await f.stat('a'));
+});
+
+platformTest('duplicate Web owner callbacks block preview and leave the resident untouched', async (t) => {
+  const f = await fixture(t);
+  const { agent, addCallback } = f.webResident('b');
+  addCallback();
+  assert.deepEqual(await f.start()('preview', 'b'), [409, { error: 'locked' }]);
+  assert.equal(f.residents.get('b'), agent);
+  assert.ok(await f.stat('b'));
+  assert.deepEqual(f.attempts, []);
+});
+
+platformTest('a duplicate Web owner callback added after preview blocks confirmed deletion', async (t) => {
+  const f = await fixture(t);
+  const { agent, addCallback } = f.webResident('b');
+  const request = f.start();
+  const [status, preview] = await request('preview', 'b');
+  assert.equal(status, 200);
+  addCallback();
+  assert.deepEqual(await request('delete', 'b', preview.ticket), [409, { error: 'locked' }]);
+  assert.equal(f.residents.get('b'), agent);
+  assert.ok(await f.stat('b'));
+  assert.deepEqual(f.attempts, []);
 });
