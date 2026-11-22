@@ -138,14 +138,9 @@ window.__ModuleLoader__.load({
             // DSH Modal only exposes a warning tone. Recolor its native icon for this dialog.
             h('style', null, `
               .dsh-session-delete-confirm h2 > svg[aria-hidden="true"] { color: ${dangerColor}; }
-              .dsh-session-delete-confirm .dsh-session-delete-confirm-action:not(:disabled) {
-                --dsh-button-outline-color: ${dangerColor};
-                color: ${dangerColor};
-              }
-              @media (hover: hover) {
-                .dsh-session-delete-confirm .dsh-session-delete-confirm-action:hover:not(:disabled) {
-                  background: var(--dsw-alias-interactive-bg-hover-danger);
-                }
+              .dsh-session-delete-confirm .dsh-session-delete-confirm-action {
+                --dsw-alias-button-primary-fill: ${dangerColor};
+                --dsw-alias-button-primary-hover: ${dangerColor};
               }
             `),
             h(Modal, {
@@ -155,7 +150,7 @@ window.__ModuleLoader__.load({
                 h('span', { id: descriptionId, hidden: true }, description),
                 h(Button, { variant: 'outline', 'data-modal-autofocus': true, 'aria-describedby': descriptionId,
                   disabled: pending, onClick: dismiss }, t('cancel')),
-                h(Button, { variant: 'outline', className: 'dsh-session-delete-confirm-action', disabled: pending,
+                h(Button, { variant: 'primary', className: 'dsh-session-delete-confirm-action', disabled: pending,
                   'aria-describedby': descriptionId, onClick: confirm }, t('confirm'))),
             }, pending ? h('span', { role: 'status' }, t('pending')) : undefined));
         }
