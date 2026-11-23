@@ -68,16 +68,16 @@ export async function removeStaleProjection(ctx, ids) {
     if (directory.dev !== expectedDirectory.dev || directory.ino !== expectedDirectory.ino) {
       return { removed: 0, skipped: targets.length };
     }
-    // On case-insensitive volumes a differently cased key could resolve to the
-    // same path. Match the actual stored key, not the volume's name lookup.
-    const exactNames = table ? undefined : new Set(await readdir(path));
+    // On case-insensitive volumes (including mounted volumes on Linux/WSL) a
+    // differently cased key could resolve to the same path. Match the actual stored key.
+    const exactNames = new Set(await readdir(table ? `/proc/self/fd/${table.fd}` : path));
     for (const id of targets) {
-      if (typeof id !== 'string' || id.length > 200 || !safeKey.test(id)) {
+      if (typeof id !== 'string' || !safeKey.test(id)) {
         result.skipped++;
         continue;
       }
       const name = `${id}.json`;
-      if (exactNames && !exactNames.has(name)) continue;
+      if (!exactNames.has(name)) continue;
       const file = table ? `/proc/self/fd/${table.fd}/${name}` : join(path, name);
       const before = await stat(file);
       if (!before) continue;
@@ -107,7 +107,7 @@ export async function removeStaleProjection(ctx, ids) {
         const parent = table ? directory : await directoryTree(path, false);
         if (parent.dev !== directory.dev || parent.ino !== directory.ino
           || bytesRead !== bytes.length || !isCheckpoint(bytes.toString('utf8'))
-          || await ctx.sessionPersistence.stat(id)
+          || ctx.get?.('sessions')?.get?.(id) || await ctx.sessionPersistence.stat(id)
           || !canUseFallback(ctx, facility, backend, root) || !sameFile(opened, await stat(file))) {
           result.skipped++;
           continue;

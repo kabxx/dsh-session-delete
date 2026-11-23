@@ -17,7 +17,7 @@ function fail(code) {
 
 // Match DSH JSONL's UTF-16 segment encoding, including lone surrogates.
 function encodeId(id) {
-  if (typeof id !== 'string' || id.length < 1 || id.length > 200) fail('unsafe-path');
+  if (typeof id !== 'string' || id.length < 1 || id.length > 1024) fail('unsafe-path');
   if (id === '.') return '~002E';
   if (id === '..') return '~002E~002E';
   return id.replace(/[^A-Za-z0-9._-]/gu, (part) => part.split('').map((unit) =>

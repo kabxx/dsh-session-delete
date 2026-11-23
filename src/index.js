@@ -1,21 +1,27 @@
-import { createSessionDelete } from './delete.js';
+import { createRecoveryLoop, createSessionDelete } from './delete.js';
 
 export const inject = ['connection', 'workspaceRegistry', 'sessions', 'agents', 'sessionController', 'sessionPersistence', 'dshHomePath'];
 
 export function apply(ctx) {
+  const lifetime = new AbortController();
+  let recovery;
   const remove = createSessionDelete(ctx, {
     root: ctx.dshHomePath('sessions'),
     journal: ctx.dshHomePath('plugins', '@kabxx', 'dsh-session-delete', 'delete-intent.json'),
     legacyJournal: ctx.dshHomePath('session-delete', 'delete-intent.json'),
     legacyTrash: ctx.dshHomePath('session-delete', 'trash.json'),
+    onPending: () => recovery?.notifyPending(),
+  });
+  recovery = createRecoveryLoop(remove.recoverPending, {
+    signal: lifetime.signal,
+    onError: (error) => ctx.logger.warn('Session delete startup recovery: %s', error),
   });
   ctx.effect(() => {
-    const lifetime = new AbortController();
-    const startup = setImmediate(() => {
-      remove.recoverPending(lifetime.signal).catch((error) => ctx.logger.warn('Session delete startup recovery: %s', error));
-    });
+    recovery.triggerNow();
+    const offDisposed = ctx.on('session/disposed', () => recovery.notifySessionDisposed());
     return () => {
-      clearImmediate(startup);
+      offDisposed();
+      recovery.dispose();
       lifetime.abort();
     };
   });

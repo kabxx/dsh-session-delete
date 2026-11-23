@@ -135,11 +135,7 @@ export async function withDirectoryLocks({ root, staging, members, transaction, 
       if (detached && (!committed || !detached.isDirectory() || !sameIdentity(detached, item.member.identity))) refuse('collision');
       if ((await directoryTree(dirname(item.source), false)).dev !== device) refuse('cross-device');
       const current = await stat(item.source);
-      if (phase === 'prepared') continue;
-      if (phase === 'committed') {
-        if (sameIdentity(current, item.member.identity)) refuse('collision');
-        continue;
-      }
+      if (phase === 'prepared' || phase === 'committed') continue;
       if (detached || (committed && !current)) continue;
       if (!sameIdentity(current, item.member.identity)) {
         if (committed) continue;

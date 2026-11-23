@@ -103,3 +103,19 @@ test('refuses to follow a symlink in the table directory path', platform, async 
   assert.deepEqual(await removeStaleProjection(ctx, ['target']), { removed: 0, skipped: 1 });
   assert.equal(await readFile(unrelated, 'utf8'), record('unrelated'));
 });
+
+test('supports >200-char custom IDs, exact-case matching, and live session guards', platform, async (t) => {
+  const { ctx, file, seed, record } = await fixture(t);
+  const longId = `custom-${'a'.repeat(213)}`;
+  await Promise.all([seed(longId), seed('SessionA'), seed('live-recreated')]);
+  const live = new Set(['live-recreated']);
+  const liveCtx = {
+    ...ctx,
+    get: (key) => (key === 'sessions' ? { get: (id) => (live.has(id) ? { id } : undefined) } : ctx.get(key)),
+  };
+
+  assert.deepEqual(await removeStaleProjection(liveCtx, [longId, 'sessiona', 'live-recreated']), { removed: 1, skipped: 1 });
+  await assert.rejects(access(file(longId)), { code: 'ENOENT' });
+  assert.equal(await readFile(file('SessionA'), 'utf8'), record('SessionA'));
+  assert.equal(await readFile(file('live-recreated'), 'utf8'), record('live-recreated'));
+});

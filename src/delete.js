@@ -15,18 +15,108 @@ const recordJournal = Symbol('record journal');
 const ticketLifetime = 5 * 60_000;
 const maxTickets = 64;
 const settlementBudget = 1200;
+const defaultRecoveryDelays = [2_000, 5_000, 15_000, 30_000, 60_000];
 const knownErrors = new Set([
   'busy', 'locked', 'unsupported', 'unsafe-path', 'cross-device', 'collision', 'missing',
   'changed', 'dependent-fork', 'cleanup-pending', 'restore-pending', 'recovery-pending', 'restored',
   'authentication-required', 'bad-request',
 ]);
 
+export function createRecoveryLoop(recoverPending, {
+  signal,
+  delays = defaultRecoveryDelays,
+  disposedDelay = 200,
+  onError,
+} = {}) {
+  let attempt = 0;
+  let timer = null;
+  let scheduledAt = Infinity;
+  let running = false;
+  let rerun = false;
+  let pending = false;
+
+  function clearTimer() {
+    if (timer === null) return;
+    clearTimeout(timer);
+    timer = null;
+    scheduledAt = Infinity;
+  }
+
+  function schedule(delayMs) {
+    if (signal?.aborted) return;
+    const wait = Math.max(0, delayMs);
+    if (running) {
+      rerun = true;
+      return;
+    }
+    const target = performance.now() + wait;
+    if (timer !== null && scheduledAt <= target) return;
+    clearTimer();
+    scheduledAt = target;
+    timer = setTimeout(() => {
+      timer = null;
+      scheduledAt = Infinity;
+      void run();
+    }, wait);
+    timer.unref?.();
+  }
+
+  async function run() {
+    if (signal?.aborted || running) return;
+    running = true;
+    let remaining = true;
+    try {
+      remaining = await recoverPending(signal);
+    } catch (error) {
+      onError?.(error);
+    } finally {
+      running = false;
+    }
+    if (signal?.aborted) return;
+    pending = Boolean(remaining);
+    if (!pending) {
+      attempt = 0;
+      rerun = false;
+      return;
+    }
+    if (rerun) {
+      rerun = false;
+      attempt = 0;
+      schedule(0);
+      return;
+    }
+    const wait = delays[Math.min(attempt, delays.length - 1)] ?? 60_000;
+    attempt += 1;
+    schedule(wait);
+  }
+
+  return {
+    triggerNow() {
+      attempt = 0;
+      schedule(0);
+    },
+    notifyPending() {
+      pending = true;
+      attempt = 0;
+      schedule(delays[0] ?? 2_000);
+    },
+    notifySessionDisposed() {
+      if (!pending) return;
+      attempt = 0;
+      schedule(disposedDelay);
+    },
+    dispose() {
+      clearTimer();
+    },
+  };
+}
+
 function fail(code) {
   throw Object.assign(new Error(`Session delete (${code})`), { code });
 }
 
 function validId(id) {
-  return typeof id === 'string' && id.length > 0 && id.length <= 200 && !/[\u0000-\u001f]/u.test(id);
+  return typeof id === 'string' && id.length > 0 && id.length <= 1024 && !/[\u0000-\u001f]/u.test(id);
 }
 
 async function readJson(path) {
@@ -111,11 +201,12 @@ function samePlan(a, b) {
   });
 }
 
-export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyTrash }) {
+export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyTrash, onPending }) {
   const staging = join(dirname(journal), 'directory-deletion');
   const previousJournal = legacyJournal && legacyJournal !== journal ? legacyJournal : undefined;
   const registry = ctx.workspaceRegistry;
   const tickets = new Map();
+  const lastRecoveryFailure = new Map();
   let chain = Promise.resolve();
 
   async function assertInactive(ids, allowResident = false) {
@@ -164,21 +255,151 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
     return { members, writers };
   }
 
-  async function removeNativeRecords(members) {
-    const ids = members.map(({ id }) => id);
-    const cache = ctx.get('storageDomain')?.get('session_projcache')?.table('sessions');
-    for (const id of ids) {
-      for (const workspace of registry.list()) {
-        if (workspace.sessionIds.includes(id)) await registry.get(workspace.id).detachSession(id);
+  function workspaceTable() {
+    const table = ctx.get('storageDomain')?.get('workspace')?.table?.('workspaces');
+    return typeof table?.get === 'function' ? table : undefined;
+  }
+
+  function rawWorkspaceSessionIds(workspace, table = workspaceTable()) {
+    const stored = table?.get(workspace.id)?.sessionIds;
+    return Array.isArray(stored) ? stored : undefined;
+  }
+
+  function captureWorkspacePlacements(memberIds) {
+    const targetSet = new Set(memberIds);
+    const placements = {};
+    const table = workspaceTable();
+    for (const workspace of registry.list()) {
+      const ids = rawWorkspaceSessionIds(workspace, table) ?? workspace.sessionIds;
+      if (!Array.isArray(ids)) continue;
+      for (const memberId of memberIds) {
+        const index = ids.indexOf(memberId);
+        if (index === -1) continue;
+        placements[memberId] = {
+          workspaceId: workspace.id,
+          before: ids.slice(index + 1).filter((other) => !targetSet.has(other)).slice(0, 64),
+        };
       }
-      await registry.unpinSession(id);
-      await registry.unarchiveSession(id);
-      if (cache) await cache.delete(id);
     }
-    if (!cache) await removeStaleProjection(ctx, ids);
+    return Object.keys(placements).length > 0 ? placements : undefined;
+  }
+
+  async function preservePreparedWorkspaces(workspace, rawIds, entries) {
+    if (!Array.isArray(rawIds) || !Array.isArray(entries)) return;
+    const dirtyJournals = new Set();
+    for (const entry of entries) {
+      if (entry.phase !== 'prepared') continue;
+      const entryIds = new Set(entry.members.map(({ id }) => id));
+      let updated = false;
+      for (const { id: memberId } of entry.members) {
+        if (entry.workspaces?.[memberId]) continue;
+        const index = rawIds.indexOf(memberId);
+        if (index === -1) continue;
+        entry.workspaces = {
+          ...entry.workspaces,
+          [memberId]: {
+            workspaceId: workspace.id,
+            before: rawIds.slice(index + 1).filter((other) => !entryIds.has(other)).slice(0, 64),
+          },
+        };
+        updated = true;
+      }
+      if (updated && entry[recordJournal]) dirtyJournals.add(entry[recordJournal]);
+    }
+    for (const sourceJournal of dirtyJournals) {
+      await writeEntries(sourceJournal, entries.filter((item) => item[recordJournal] === sourceJournal));
+    }
+  }
+
+  async function restoreWorkspaceMembership(entry, entries) {
+    const table = workspaceTable();
+    const entryIds = new Set(entry.members.map(({ id }) => id));
+    for (const { id: memberId } of entry.members) {
+      if (!await ctx.sessionPersistence.stat(memberId)) continue;
+      const saved = entry.workspaces?.[memberId];
+      let workspace = saved && typeof saved.workspaceId === 'string' ? registry.get?.(saved.workspaceId) : undefined;
+      let before = Array.isArray(saved?.before) ? saved.before : undefined;
+      if (!workspace && !saved && table) {
+        workspace = registry.list().find((candidate) => {
+          const rawIds = rawWorkspaceSessionIds(candidate, table);
+          return Array.isArray(rawIds) && rawIds.includes(memberId) && !candidate.sessionIds?.includes(memberId);
+        });
+        if (workspace) {
+          const rawIds = rawWorkspaceSessionIds(workspace, table);
+          const index = rawIds.indexOf(memberId);
+          before = rawIds.slice(index + 1).filter((other) => !entryIds.has(other)).slice(0, 64);
+        }
+      }
+      if (!workspace || typeof workspace.attachSession !== 'function') continue;
+      if (workspace.sessionIds?.includes(memberId)) continue;
+      try {
+        const rawIds = rawWorkspaceSessionIds(workspace, table);
+        if (Array.isArray(rawIds) && rawIds.includes(memberId)) {
+          // DSH restarted while the session was staged, so the raw record still holds the ID
+          // while the runtime header index omits it. Refresh membership only when the directory exists.
+          if (typeof workspace.status === 'function' && await workspace.status() !== 'ok') continue;
+          await preservePreparedWorkspaces(workspace, rawIds, entries);
+          await workspace.detachSession?.(memberId);
+        }
+        await workspace.attachSession(memberId);
+        if (typeof workspace.insertSessionBefore === 'function' && Array.isArray(before) && (workspace.sessionIds?.length ?? 0) > 1) {
+          const anchor = before.find((candidate) => candidate !== memberId && workspace.sessionIds?.includes(candidate));
+          try {
+            await workspace.insertSessionBefore(memberId, anchor);
+          } catch (orderError) {
+            ctx.logger.warn('Session delete rollback workspace order: %s', orderError);
+          }
+        }
+      } catch (restoreError) {
+        ctx.logger.warn('Session delete rollback workspace membership: %s', restoreError);
+      }
+    }
+  }
+
+  async function sessionExists(id) {
+    return Boolean(ctx.sessions.get(id) || await ctx.sessionPersistence.stat(id));
+  }
+
+  async function finish(members, entries) {
+    // A newly created session of the same ID must keep its native records.
+    // Re-check before each async step to narrow the window for concurrent same-ID recreation.
+    const cache = ctx.get('storageDomain')?.get('session_projcache')?.table?.('sessions');
+    const table = workspaceTable();
+    const absentIds = [];
+    for (const { id } of members) {
+      if (await sessionExists(id)) continue;
+      ctx.emit('api-session/removed', id);
+      let recreated = false;
+      for (const workspace of registry.list()) {
+        const rawIds = rawWorkspaceSessionIds(workspace, table);
+        if (Array.isArray(rawIds) && !rawIds.includes(id)) continue;
+        if (await sessionExists(id)) {
+          recreated = true;
+          break;
+        }
+        await preservePreparedWorkspaces(workspace, rawIds, entries);
+        const entity = registry.get ? registry.get(workspace.id) : workspace;
+        await entity?.detachSession?.(id);
+      }
+      if (recreated || await sessionExists(id)) continue;
+      await registry.unpinSession(id);
+      if (await sessionExists(id)) continue;
+      await registry.unarchiveSession(id);
+      if (cache) {
+        if (await sessionExists(id)) continue;
+        await cache.delete(id);
+      }
+      absentIds.push(id);
+    }
+    if (absentIds.length === 0) return;
+    if (!cache) await removeStaleProjection(ctx, absentIds);
     const query = ctx.get('sessionQuery');
     if (query?.config?.openAt === 'never' || !query) {
-      await cleanStaleSearch(configuredDisabledSearchPath(ctx, query), ids);
+      const staleIds = [];
+      for (const id of absentIds) {
+        if (!await sessionExists(id)) staleIds.push(id);
+      }
+      if (staleIds.length > 0) await cleanStaleSearch(configuredDisabledSearchPath(ctx, query), staleIds);
     } else if (typeof query.searchSessions === 'function') {
       const { openAt, path } = query.config ?? {};
       if (openAt === 'first-search' && typeof path === 'string' && path !== ':memory:') {
@@ -196,19 +417,11 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
     }
   }
 
-  async function finish(members) {
-    // A newly created session of the same ID must keep its native records.
-    for (const { id } of members) {
-      if (await ctx.sessionPersistence.stat(id)) fail('changed');
-    }
-    for (const { id } of members) ctx.emit('api-session/removed', id);
-    await removeNativeRecords(members);
-  }
-
   async function recoverEntry(entry, entries) {
     const sourceJournal = entry[recordJournal];
     const sourceStaging = join(dirname(sourceJournal), 'directory-deletion');
     const remaining = entries.filter((pending) => pending !== entry);
+    const failureKey = `${sourceJournal}:${entry.transaction ?? entry.version}:${entry.phase ?? 'legacy'}`;
     try {
       const ids = new Set(entry.members.map(({ id }) => id));
       if (remaining.some(({ members }) => members.some(({ id }) => ids.has(id)))) fail('collision');
@@ -219,11 +432,19 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
       const directoryPlan = { root, staging: sourceStaging, members, transaction, phase };
       if (phase === 'prepared') {
         await withDirectoryLocks(directoryPlan, (lease) => lease.rollback());
+        await restoreWorkspaceMembership(entry, entries);
+      } else if (phase === 'committed') {
+        // Committed v3 entries already detached every original directory before committing.
+        // Do not let a recreated replacement session of the same ID block clearing old staging or sibling records.
+        await withDirectoryLocks(directoryPlan, async (lease) => {
+          await lease.remove();
+          await finish(entry.members, entries);
+        });
       } else {
         const complete = async (lease) => {
           await assertInactive(entry.members.map(({ id }) => id));
           await lease.remove();
-          await finish(entry.members);
+          await finish(entry.members, entries);
         };
         if (entry.version === 1) {
           await withDeleteLocks({ root, members: entry.members, committed: true }, complete);
@@ -232,8 +453,13 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
         }
       }
       await writeEntries(sourceJournal, remaining.filter((pending) => pending[recordJournal] === sourceJournal));
+      lastRecoveryFailure.delete(failureKey);
     } catch (error) {
-      ctx.logger.warn('Session delete recovery: %s', error);
+      const signature = `${error?.code ?? ''}:${error?.message ?? String(error)}`;
+      if (lastRecoveryFailure.get(failureKey) !== signature) {
+        lastRecoveryFailure.set(failureKey, signature);
+        ctx.logger.warn('Session delete recovery: %s', error);
+      }
       fail(entry.phase === 'prepared' ? 'restore-pending' : 'cleanup-pending');
     }
     return remaining;
@@ -245,7 +471,19 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
   }
 
   function sessionCookie(request) {
-    return createHash('sha256').update(request.headers.get('cookie') ?? '').digest('hex');
+    const raw = request.headers.get('cookie') ?? '';
+    const authCookies = raw.split(';')
+      .map((segment) => {
+        const at = segment.indexOf('=');
+        if (at === -1) return null;
+        const name = segment.slice(0, at).trim();
+        if (!name.startsWith('dsh-auth-')) return null;
+        return `${name}=${segment.slice(at + 1).trim()}`;
+      })
+      .filter(Boolean)
+      .sort()
+      .join('; ');
+    return createHash('sha256').update(authCookies).digest('hex');
   }
 
   async function preview(id, request, entries) {
@@ -259,7 +497,7 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
       for (const [key, record] of tickets) if (record.expires <= now) tickets.delete(key);
       if (tickets.size >= maxTickets) tickets.delete(tickets.keys().next().value);
       tickets.set(ticket, { id, members, files: lease.fingerprint, cookie: sessionCookie(request), expires: now + ticketLifetime });
-      return { ticket, count: members.length - 1 };
+      return { ticket, count: members.length - 1, memberIds: members.map(({ id: memberId }) => memberId) };
     });
   }
 
@@ -279,6 +517,7 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
     }
     const localEntries = entries.filter((entry) => entry[recordJournal] === journal);
     let prepared;
+    let committedEntry;
     let committing = false;
     let committed = false;
     try {
@@ -288,32 +527,47 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
           async prepare(plan) {
             if (!samePlan(members, (await describe(id, entries)).members)) fail('changed');
             request.signal.throwIfAborted();
-            const entry = { version: 3, phase: 'prepared', pluginVersion: manifest.version, ...plan, [recordJournal]: journal };
+            const workspaces = captureWorkspacePlacements(members.map((member) => member.id));
+            const entry = {
+              version: 3, phase: 'prepared', pluginVersion: manifest.version, ...plan,
+              ...(workspaces ? { workspaces } : {}),
+              [recordJournal]: journal,
+            };
             await writeEntries(journal, [...localEntries, entry]);
             prepared = entry;
           },
           async commit() {
             request.signal.throwIfAborted();
             committing = true;
-            await writeEntries(journal, [...localEntries, { ...prepared, phase: 'committed' }]);
+            const { workspaces: _workspaces, ...committedData } = prepared;
+            const entry = { ...committedData, phase: 'committed', [recordJournal]: journal };
+            await writeEntries(journal, [...localEntries, entry]);
+            committedEntry = entry;
             committed = true;
           },
         });
-        await finish(members);
+        await finish(members, [...entries, committedEntry]);
         await writeEntries(journal, localEntries);
       });
     } catch (error) {
       if (!prepared) throw error;
       if (committed) {
         ctx.logger.warn('Session delete committed cleanup: %s', error);
+        onPending?.();
         return { deleted: true, cleanupPending: true };
       }
       if (committing) {
         // Do not guess which marker persisted if publication or its fsync failed.
         ctx.logger.warn('Session delete commit: %s', error);
+        onPending?.();
         fail('recovery-pending');
       }
-      await recoverEntry(prepared, [...entries, prepared]);
+      try {
+        await recoverEntry(prepared, [...entries, prepared]);
+      } catch (recoveryError) {
+        onPending?.();
+        throw recoveryError;
+      }
       fail('restored');
     }
     return { deleted: true };
@@ -368,14 +622,19 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
   };
   handle.recoverPending = (signal) => {
     const result = chain.then(async () => {
-      if (signal?.aborted || (!await journalExists(journal) && (!previousJournal || !await journalExists(previousJournal)))) return;
+      if (signal?.aborted || (!await journalExists(journal) && (!previousJournal || !await journalExists(previousJournal)))) return false;
+      let pending = false;
       await withJournal(async (entries) => {
         for (const entry of entries.filter((entry) => entry.version === 3 || entry[recordJournal] === previousJournal)) {
-          if (signal?.aborted) break;
+          if (signal?.aborted) {
+            pending = true;
+            break;
+          }
           try { entries = await recoverEntry(entry, entries); }
-          catch { /* The failure is recorded and isolated to this group. */ }
+          catch { pending = true; /* The failure is recorded and isolated to this group. */ }
         }
       });
+      return pending;
     });
     chain = result.then(() => {}, () => {});
     return result;
