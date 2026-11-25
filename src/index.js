@@ -1,3 +1,4 @@
+import manifest from '../package.json' with { type: 'json' };
 import { createRecoveryLoop, createSessionDelete } from './delete.js';
 
 export const inject = ['connection', 'workspaceRegistry', 'sessions', 'agents', 'sessionController', 'sessionPersistence', 'dshHomePath'];
@@ -5,10 +6,15 @@ export const inject = ['connection', 'workspaceRegistry', 'sessions', 'agents', 
 export function apply(ctx) {
   const lifetime = new AbortController();
   let recovery;
+  const pluginHome = (...segments) => ctx.dshHomePath('plugins', ...manifest.name.split('/'), ...segments);
   const remove = createSessionDelete(ctx, {
     root: ctx.dshHomePath('sessions'),
-    journal: ctx.dshHomePath('plugins', '@kabxx', 'dsh-session-delete', 'delete-intent.json'),
-    legacyJournal: ctx.dshHomePath('session-delete', 'delete-intent.json'),
+    journal: pluginHome(`v${manifest.version}`, 'delete-intent.json'),
+    legacyJournals: [
+      ctx.dshHomePath('session-delete', 'delete-intent.json'),
+      pluginHome('delete-intent.json'),
+    ],
+    legacyVersionsRoot: pluginHome(),
     legacyTrash: ctx.dshHomePath('session-delete', 'trash.json'),
     onPending: () => recovery?.notifyPending(),
   });

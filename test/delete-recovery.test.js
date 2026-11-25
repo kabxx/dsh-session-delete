@@ -233,17 +233,85 @@ platformTest('new deletes use the package journal while legacy staged data is re
   await assert.rejects(lstat(pending), { code: 'ENOENT' });
 });
 
-platformTest('a fresh install does not create the legacy directory', async (t) => {
+platformTest('a fresh install does not create the legacy directory or parent lock file', async (t) => {
   const f = await fixture(t);
-  const journal = join(f.base, 'plugins', '@kabxx', 'dsh-session-delete', 'delete-intent.json');
+  const pluginRoot = join(f.base, 'plugins', '@kabxx', 'dsh-session-delete');
+  const journal = join(pluginRoot, `v${manifest.version}`, 'delete-intent.json');
   const legacy = join(f.base, 'previous', 'delete-intent.json');
+  const unversioned = join(pluginRoot, 'delete-intent.json');
+  const options = { journal, legacyJournals: [legacy, unversioned], legacyVersionsRoot: pluginRoot };
+
+  assert.equal(await f.start(options).recover(), false);
+  await assert.rejects(lstat(pluginRoot), { code: 'ENOENT' });
+
   f.failing.add('b');
-  assert.deepEqual(await confirm(f.start({ journal, legacyJournal: legacy }), 'b'),
+  assert.deepEqual(await confirm(f.start(options), 'b'),
     [200, { deleted: true, cleanupPending: true }]);
   await assert.rejects(lstat(join(legacy, '..')), { code: 'ENOENT' });
+  await assert.rejects(lstat(unversioned), { code: 'ENOENT' });
+  await assert.rejects(lstat(`${unversioned}.lock`), { code: 'ENOENT' });
   const { entries: [entry] } = JSON.parse(await readFile(journal, 'utf8'));
   assert.equal(entry.pluginVersion, manifest.version);
   assert.equal(entry.phase, 'committed');
+});
+
+platformTest('recovers unversioned and prior versioned plugin journals in place while writing new deletes under v<version>', async (t) => {
+  const f = await fixture(t);
+  const pluginRoot = join(f.base, 'plugins', '@kabxx', 'dsh-session-delete');
+  const unversionedJournal = join(pluginRoot, 'delete-intent.json');
+  const priorVersionDir = join(pluginRoot, 'v0.1.3');
+  const priorVersionJournal = join(priorVersionDir, 'delete-intent.json');
+  const currentJournal = join(pluginRoot, `v${manifest.version}`, 'delete-intent.json');
+  await mkdir(priorVersionDir, { recursive: true });
+
+  // Seed an interrupted committed group under the unversioned 0.1.3 plugin directory.
+  const groupAMembers = await Promise.all(['a', 'a-child'].map((id) => captureDirectory(f.root, id, f.locations.get(id))));
+  const unversionedStaging = join(pluginRoot, 'directory-deletion');
+  let pendingA;
+  await assert.rejects(withDirectoryLocks({ root: f.root, staging: unversionedStaging, members: groupAMembers }, (lease) => lease.remove({
+    async prepare(plan) {
+      pendingA = join(unversionedStaging, plan.transaction);
+      lease.entry = { version: 3, phase: 'committed', ...plan };
+    },
+    async commit() {
+      await writeFile(unversionedJournal, JSON.stringify({ version: 4, entries: [lease.entry] }));
+      throw new Error('simulated unversioned interruption');
+    },
+  })), /simulated unversioned interruption/u);
+
+  // Seed an interrupted prepared group under a prior versioned directory.
+  const groupBMembers = [await captureDirectory(f.root, 'b', f.locations.get('b'))];
+  const priorStaging = join(priorVersionDir, 'directory-deletion');
+  await assert.rejects(withDirectoryLocks({ root: f.root, staging: priorStaging, members: groupBMembers }, (lease) => lease.remove({
+    async prepare(plan) {
+      const entry = { version: 3, phase: 'prepared', ...plan };
+      await writeFile(priorVersionJournal, JSON.stringify({ version: 4, entries: [entry] }));
+    },
+    async commit() {
+      throw new Error('simulated prior-version interruption');
+    },
+  })), /simulated prior-version interruption/u);
+
+  const options = {
+    journal: currentJournal,
+    legacyJournals: [join(f.base, 'session-delete', 'delete-intent.json'), unversionedJournal],
+    legacyVersionsRoot: pluginRoot,
+  };
+
+  // Unrelated deletes use the new versioned journal without prematurely mutating older journals.
+  assert.deepEqual(await confirm(f.start(options), 'c'), [200, { deleted: true }]);
+  assert.deepEqual(JSON.parse(await readFile(currentJournal, 'utf8')).entries, []);
+  assert.equal(JSON.parse(await readFile(unversionedJournal, 'utf8')).entries.length, 1);
+  assert.equal(JSON.parse(await readFile(priorVersionJournal, 'utf8')).entries.length, 1);
+  assert.deepEqual(f.attempts, ['c']);
+
+  // Startup recovery completes the unversioned committed group and rolls back the prior-version prepared group.
+  assert.equal(await f.start(options).recover(), false);
+  assert.deepEqual(f.attempts, ['c', 'a', 'a-child']);
+  assert.deepEqual(JSON.parse(await readFile(unversionedJournal, 'utf8')).entries, []);
+  assert.deepEqual(JSON.parse(await readFile(priorVersionJournal, 'utf8')).entries, []);
+  await assert.rejects(lstat(pendingA), { code: 'ENOENT' });
+  assert.equal(await readFile(f.locations.get('b').path, 'utf8'), 'b');
 });
 
 platformTest('rollback defers recovery while an already detached replacement still has a writer', async (t) => {

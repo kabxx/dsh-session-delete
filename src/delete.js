@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, open, readFile, stat, unlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { lstat, open, readdir, readFile, stat, unlink } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { withDeleteLocks } from './delete-disk.js';
 import { captureDirectory, withDirectoryLocks } from './delete-tree.js';
@@ -159,6 +159,27 @@ async function journalExists(path) {
   }
 }
 
+async function pathExists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function isAncestorDir(dir, target) {
+  const rest = relative(dir, target);
+  return rest !== '' && rest !== '..' && !rest.startsWith(`..${sep}`) && !isAbsolute(rest);
+}
+
+async function hasJournalState(journalPath) {
+  return await pathExists(journalPath)
+    || await pathExists(`${journalPath}.lock`)
+    || await pathExists(join(dirname(journalPath), 'directory-deletion'));
+}
+
 async function readEntries(journal) {
   if (!await journalExists(journal)) return [];
   const state = await readJson(journal);
@@ -201,9 +222,14 @@ function samePlan(a, b) {
   });
 }
 
-export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyTrash, onPending }) {
+export function createSessionDelete(ctx, {
+  root, journal, legacyJournal, legacyJournals, legacyVersionsRoot, legacyTrash, onPending,
+}) {
   const staging = join(dirname(journal), 'directory-deletion');
-  const previousJournal = legacyJournal && legacyJournal !== journal ? legacyJournal : undefined;
+  const configuredLegacyJournals = [...new Set([
+    ...(legacyJournal ? [legacyJournal] : []),
+    ...(Array.isArray(legacyJournals) ? legacyJournals : []),
+  ].filter((path) => typeof path === 'string' && path !== journal))];
   const registry = ctx.workspaceRegistry;
   const tickets = new Map();
   const lastRecoveryFailure = new Map();
@@ -573,23 +599,66 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
     return { deleted: true };
   }
 
-  async function withJournal(run) {
-    const current = async () => {
-      await directoryTree(dirname(journal), true);
-      return withFileLock(`${journal}.lock`, async () => run([
-        ...(previousJournal ? await readEntries(previousJournal) : []),
-        ...await readEntries(journal),
-      ]));
-    };
-    if (previousJournal) {
-      // Preserve the old lock and staging layout while completing old intents in place.
-      const previousDirectory = await lstat(dirname(previousJournal)).catch((error) => {
-        if (error.code === 'ENOENT') return;
-        throw error;
-      });
-      if (previousDirectory) return withFileLock(`${previousJournal}.lock`, current);
+  async function discoverVersionedJournals() {
+    if (!legacyVersionsRoot) return [];
+    let rootInfo;
+    try { rootInfo = await lstat(legacyVersionsRoot); }
+    catch (error) {
+      if (error.code === 'ENOENT') return [];
+      throw error;
     }
-    return current();
+    if (!rootInfo.isDirectory()) fail('unsafe-path');
+    const currentVersionDir = dirname(journal);
+    const found = [];
+    for (const entry of await readdir(legacyVersionsRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !/^v\d/u.test(entry.name)) continue;
+      const dir = join(legacyVersionsRoot, entry.name);
+      if (dir === currentVersionDir) continue;
+      const candidate = join(dir, 'delete-intent.json');
+      if (candidate === journal || configuredLegacyJournals.includes(candidate)) continue;
+      if (await hasJournalState(candidate)) found.push(candidate);
+    }
+    return found.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
+  async function shouldLockConfiguredLegacy(candidate) {
+    if (isAncestorDir(dirname(candidate), journal)) return hasJournalState(candidate);
+    return pathExists(dirname(candidate));
+  }
+
+  async function withJournal(run, { createCurrent = true } = {}) {
+    // Preserve every older lock and staging layout while completing legacy intents in place.
+    const configured = [];
+    for (const candidate of configuredLegacyJournals) {
+      if (await shouldLockConfiguredLegacy(candidate)) configured.push(candidate);
+    }
+    const versioned = await discoverVersionedJournals();
+    const includeCurrent = createCurrent || await hasJournalState(journal) || await pathExists(dirname(journal));
+    const versionedLocks = includeCurrent
+      ? [...new Set([journal, ...versioned])].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+      : versioned;
+    const lockOrder = [...configured, ...versionedLocks];
+    const readOrder = [...configured, ...versioned, ...(includeCurrent ? [journal] : [])];
+
+    const acquire = async (index) => {
+      if (index >= lockOrder.length) {
+        const entries = [];
+        for (const path of readOrder) entries.push(...await readEntries(path));
+        return run(entries);
+      }
+      const target = lockOrder[index];
+      if (target === journal && createCurrent) await directoryTree(dirname(journal), true);
+      return withFileLock(`${target}.lock`, () => acquire(index + 1));
+    };
+    return acquire(0);
+  }
+
+  async function hasAnyJournal() {
+    if (await journalExists(journal)) return true;
+    for (const candidate of [...configuredLegacyJournals, ...await discoverVersionedJournals()]) {
+      if (await journalExists(candidate)) return true;
+    }
+    return false;
   }
 
   const handle = (request) => {
@@ -622,10 +691,10 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
   };
   handle.recoverPending = (signal) => {
     const result = chain.then(async () => {
-      if (signal?.aborted || (!await journalExists(journal) && (!previousJournal || !await journalExists(previousJournal)))) return false;
+      if (signal?.aborted || !await hasAnyJournal()) return false;
       let pending = false;
       await withJournal(async (entries) => {
-        for (const entry of entries.filter((entry) => entry.version === 3 || entry[recordJournal] === previousJournal)) {
+        for (const entry of entries.filter((entry) => entry.version === 3 || entry[recordJournal] !== journal)) {
           if (signal?.aborted) {
             pending = true;
             break;
@@ -633,7 +702,7 @@ export function createSessionDelete(ctx, { root, journal, legacyJournal, legacyT
           try { entries = await recoverEntry(entry, entries); }
           catch { pending = true; /* The failure is recorded and isolated to this group. */ }
         }
-      });
+      }, { createCurrent: false });
       return pending;
     });
     chain = result.then(() => {}, () => {});
